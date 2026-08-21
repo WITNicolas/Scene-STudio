@@ -287,72 +287,39 @@ function setText(id,text){var e=document.getElementById(id);if(e)e.textContent=t
 function escapeHtml(v){return String(v===undefined||v===null?"":v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");}
 function getError(e){return e&&e.message?e.message:String(e);}
 function waitForElement(id,max){return new Promise(function(resolve,reject){var n=0;(function test(){var e=document.getElementById(id);if(e)return resolve(e);if(++n>=max)return reject(new Error("Element "+id+" introuvable."));setTimeout(test,100);})();});}
-/*
- * ANALYST V2 - Selecteur de vue
- * A coller A LA FIN du script stackRoot > OnRender existant.
- *
- * Ce patch ne remplace aucune fonction metier. Il enrichit injectHtml() et
- * bindEvents() avant la reprise de initialize() apres son premier await.
+/* ANALYST V3 - PAGE UNIQUE
+ * A COLLER A LA FIN du OnRender Analyst V2 existant.
+ * Remplace le selecteur de vue precedent. Ne pas conserver les deux patches.
  */
-(function installAnalystViewSelector() {
-    var selectedAnalysisView = "pareto";
+(function installAnalystV3SinglePage() {
+    "use strict";
 
-    if (typeof injectHtml !== "function" || typeof bindEvents !== "function") {
-        console.error("Analyst : injectHtml ou bindEvents introuvable.");
+    var activeAnalystTab = "overview";
+
+    if (typeof injectHtml !== "function" ||
+        typeof bindEvents !== "function" ||
+        typeof renderDashboard !== "function") {
+        console.error("Analyst V3 : fonctions Analyst V2 introuvables.");
         return;
     }
 
     var originalInjectHtml = injectHtml;
     var originalBindEvents = bindEvents;
+    var originalRenderDashboard = renderDashboard;
 
     injectHtml = function () {
         originalInjectHtml();
 
         var content = String(html1.properties.content || "");
-
-        var css = [
-            ".ay-view-selector{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}",
-            ".ay-view-selector label{color:#718198;font-size:10px;font-weight:650}",
-            ".ay-view-select{min-width:210px}",
-            "@media(max-width:760px){.ay-view-selector{width:100%;justify-content:flex-start}.ay-view-select{min-width:0;width:100%}}"
-        ].join("");
-
+        content = removePreviousViewSelector(content);
+        content = addV3Styles(content);
+        content = identifyExistingViews(content);
+        content = addTabsAndAnomalyView(content);
+        content = content.replace("Analyst V2</div>", "Analyst V3</div>");
         content = content.replace(
-            "</style>",
-            css + "</style>"
+            "Synthese energetique, priorites et recommandations automatiques",
+            "Une page unique pour explorer les usages, profils et anomalies"
         );
-
-        var oldToolbar = '<div class="ay-toolbar"><div class="ay-series-menu" id="analystSeriesMenu"></div><div class="ay-badge" id="analystLoadingBadge">Chargement</div></div>';
-        var newToolbar = '<div class="ay-toolbar">' +
-            '<div class="ay-series-menu" id="analystSeriesMenu"></div>' +
-            '<div class="ay-view-selector">' +
-                '<label for="analystViewSelect">Vue</label>' +
-                '<select id="analystViewSelect" class="ay-select ay-view-select">' +
-                    '<option value="pareto">Pareto des usages</option>' +
-                    '<option value="profile">Profil horaire global</option>' +
-                '</select>' +
-                '<div class="ay-badge" id="analystLoadingBadge">Chargement</div>' +
-            '</div>' +
-        '</div>';
-
-        content = content.replace(oldToolbar, newToolbar);
-
-        var gridToken = '<div class="ay-grid">';
-        var firstGridIndex = content.indexOf(gridToken);
-
-        if (firstGridIndex >= 0) {
-            content = content.substring(0, firstGridIndex) +
-                '<div class="ay-grid" id="analystParetoView">' +
-                content.substring(firstGridIndex + gridToken.length);
-        }
-
-        var secondGridIndex = content.indexOf(gridToken, firstGridIndex + 1);
-
-        if (secondGridIndex >= 0) {
-            content = content.substring(0, secondGridIndex) +
-                '<div class="ay-grid" id="analystProfileView" style="display:none">' +
-                content.substring(secondGridIndex + gridToken.length);
-        }
 
         html1.properties.content = content;
     };
@@ -360,42 +327,188 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
     bindEvents = function () {
         originalBindEvents();
 
-        var viewSelect = document.getElementById("analystViewSelect");
+        Array.prototype.forEach.call(
+            document.querySelectorAll(".analyst-v3-tab"),
+            function (button) {
+                button.addEventListener("click", function () {
+                    activeAnalystTab = button.getAttribute("data-tab") || "overview";
+                    updateAnalystTab();
+                });
+            }
+        );
 
-        if (!viewSelect) {
-            console.error("Analyst : selecteur analystViewSelect introuvable.");
-            return;
-        }
-
-        viewSelect.value = selectedAnalysisView;
-        viewSelect.addEventListener("change", function () {
-            selectedAnalysisView = this.value;
-            updateAnalysisView();
-        });
-
-        updateAnalysisView();
+        updateAnalystTab();
     };
 
-    function updateAnalysisView() {
-        var paretoView = document.getElementById("analystParetoView");
-        var profileView = document.getElementById("analystProfileView");
+    renderDashboard = function () {
+        originalRenderDashboard();
+        renderAnomalyView();
+        updateAnalystTab();
+    };
 
-        if (!paretoView || !profileView) return;
+    function removePreviousViewSelector(content) {
+        content = content.replace(
+            /<div class="ay-view-selector">[\s\S]*?<div class="ay-badge" id="analystLoadingBadge">Chargement<\/div>[\s\S]*?<\/div>/,
+            '<div class="ay-badge" id="analystLoadingBadge">Chargement</div>'
+        );
+        return content;
+    }
 
-        var showPareto = selectedAnalysisView === "pareto";
-        paretoView.style.display = showPareto ? "grid" : "none";
-        profileView.style.display = showPareto ? "none" : "grid";
+    function addV3Styles(content) {
+        var css = [
+            ".ay-v3-tabs{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px;padding:7px;border:1px solid #dce5ed;border-radius:14px;background:#fff}",
+            ".analyst-v3-tab{min-height:36px;padding:0 16px;border:1px solid transparent;border-radius:10px;background:transparent;color:#718198;font-family:inherit;font-size:11px;font-weight:650;cursor:pointer;transition:.15s ease}",
+            ".analyst-v3-tab:hover{color:#087fc1;background:#f4f9fc}",
+            ".analyst-v3-tab.active{color:#fff;background:#149fe3;border-color:#149fe3;box-shadow:0 4px 12px rgba(20,159,227,.2)}",
+            ".ay-v3-view[hidden]{display:none!important}",
+            ".ay-anomaly-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:12px}",
+            ".ay-anomaly-card{padding:14px;border:1px solid #dce5ed;border-radius:12px;background:#fff}",
+            ".ay-anomaly-card.warning{border-left:4px solid #f59e0b}",
+            ".ay-anomaly-card.critical{border-left:4px solid #ef4444}",
+            ".ay-anomaly-card-label{color:#718198;font-size:9px;font-weight:650;text-transform:uppercase}",
+            ".ay-anomaly-card-value{margin-top:7px;color:#10294d;font-size:24px;font-weight:700}",
+            ".ay-severity{display:inline-flex;align-items:center;padding:4px 8px;border-radius:12px;font-size:9px;font-weight:700}",
+            ".ay-severity.warning{color:#9a6700;background:#fff8e7}",
+            ".ay-severity.critical{color:#b42318;background:#fff1f2}",
+            ".ay-empty{padding:28px;text-align:center;color:#718198;font-size:11px}",
+            "@media(max-width:760px){.ay-v3-tabs{display:grid;grid-template-columns:1fr}.analyst-v3-tab{width:100%}.ay-anomaly-summary{grid-template-columns:1fr}.ay-table{display:block;overflow-x:auto;white-space:nowrap}}"
+        ].join("");
+
+        return content.replace("</style>", css + "</style>");
+    }
+
+    function identifyExistingViews(content) {
+        var gridToken = '<div class="ay-grid">';
+        var firstGrid = content.indexOf(gridToken);
+
+        if (firstGrid >= 0) {
+            content = content.substring(0, firstGrid) +
+                '<div class="ay-grid ay-v3-view" id="analystOverviewView" data-view="overview">' +
+                content.substring(firstGrid + gridToken.length);
+        }
+
+        var secondGrid = content.indexOf(gridToken, firstGrid + 1);
+        if (secondGrid >= 0) {
+            content = content.substring(0, secondGrid) +
+                '<div class="ay-grid ay-v3-view" id="analystProfileView" data-view="profile" hidden>' +
+                content.substring(secondGrid + gridToken.length);
+        }
+
+        return content;
+    }
+
+    function addTabsAndAnomalyView(content) {
+        var kpiMarker = '<div class="ay-kpis">';
+        var kpiStart = content.indexOf(kpiMarker);
+        if (kpiStart < 0) return content;
+
+        var firstView = content.indexOf('<div class="ay-grid ay-v3-view"', kpiStart);
+        if (firstView < 0) return content;
+
+        var tabs = [
+            '<div class="ay-v3-tabs" role="tablist" aria-label="Navigation Analyst">',
+            '<button class="analyst-v3-tab active" type="button" data-tab="overview" role="tab">Vue d ensemble</button>',
+            '<button class="analyst-v3-tab" type="button" data-tab="profile" role="tab">Profil horaire</button>',
+            '<button class="analyst-v3-tab" type="button" data-tab="anomalies" role="tab">Anomalies</button>',
+            '</div>'
+        ].join("");
+
+        content = content.substring(0, firstView) + tabs + content.substring(firstView);
+
+        var dashboardEnd = content.lastIndexOf("</div>");
+        if (dashboardEnd < 0) return content;
+
+        var anomalies = [
+            '<div class="ay-v3-view" id="analystAnomalyView" data-view="anomalies" hidden>',
+            '<div class="ay-anomaly-summary">',
+            '<div class="ay-anomaly-card"><div class="ay-anomaly-card-label">Total anomalies</div><div class="ay-anomaly-card-value" id="ayV3AnomalyTotal">0</div></div>',
+            '<div class="ay-anomaly-card warning"><div class="ay-anomaly-card-label">A surveiller</div><div class="ay-anomaly-card-value" id="ayV3WarningTotal">0</div></div>',
+            '<div class="ay-anomaly-card critical"><div class="ay-anomaly-card-label">Critiques</div><div class="ay-anomaly-card-value" id="ayV3CriticalTotal">0</div></div>',
+            '</div>',
+            '<div class="ay-panel">',
+            '<div class="ay-panel-header"><div><div class="ay-panel-title">Detail des anomalies</div><div class="ay-panel-subtitle">Valeur, reference horaire, ecart et score</div></div><div class="ay-badge" id="ayV3AnomalyBadge">0 resultat</div></div>',
+            '<div id="ayV3AnomalyTable"></div>',
+            '</div>',
+            '</div>'
+        ].join("");
+
+        return content.substring(0, dashboardEnd) + anomalies + content.substring(dashboardEnd);
+    }
+
+    function updateAnalystTab() {
+        Array.prototype.forEach.call(
+            document.querySelectorAll(".analyst-v3-tab"),
+            function (button) {
+                var isActive = button.getAttribute("data-tab") === activeAnalystTab;
+                button.classList.toggle("active", isActive);
+                button.setAttribute("aria-selected", isActive ? "true" : "false");
+            }
+        );
+
+        Array.prototype.forEach.call(
+            document.querySelectorAll(".ay-v3-view"),
+            function (view) {
+                view.hidden = view.getAttribute("data-view") !== activeAnalystTab;
+            }
+        );
 
         window.requestAnimationFrame(function () {
-            if (showPareto && chart) {
+            if (activeAnalystTab === "overview" && chart) {
                 chart.resize();
                 chart.update("none");
             }
-
-            if (!showPareto && hourChart) {
+            if (activeAnalystTab === "profile" && hourChart) {
                 hourChart.resize();
                 hourChart.update("none");
             }
         });
+    }
+
+    function renderAnomalyView() {
+        var table = document.getElementById("ayV3AnomalyTable");
+        if (!table || typeof allAnomalies !== "function") return;
+
+        var anomalies = allAnomalies();
+        var warningCount = 0;
+        var criticalCount = 0;
+
+        anomalies.forEach(function (item) {
+            if (item.point.severity === "critical") criticalCount++;
+            else if (item.point.severity === "warning") warningCount++;
+        });
+
+        setText("ayV3AnomalyTotal", anomalies.length);
+        setText("ayV3WarningTotal", warningCount);
+        setText("ayV3CriticalTotal", criticalCount);
+        setText("ayV3AnomalyBadge", anomalies.length + " resultat(s)");
+
+        if (!anomalies.length) {
+            table.innerHTML = '<div class="ay-empty">Aucune anomalie ne depasse les seuils configures sur cette periode.</div>';
+            return;
+        }
+
+        var html = [
+            '<table class="ay-table">',
+            '<thead><tr>',
+            '<th>Niveau</th><th>Usage</th><th>Date</th><th>Valeur</th>',
+            '<th>Reference</th><th>Ecart</th><th>Score</th>',
+            '</tr></thead><tbody>'
+        ].join("");
+
+        anomalies.forEach(function (item) {
+            var point = item.point;
+            var levelLabel = point.severity === "critical" ? "Critique" : "A surveiller";
+            html += '<tr>' +
+                '<td><span class="ay-severity ' + point.severity + '">' + levelLabel + '</span></td>' +
+                '<td><span class="ay-dot" style="background:' + item.series.color + '"></span>' + escapeHtml(item.series.name) + '</td>' +
+                '<td>' + escapeHtml(formatDate(point.date)) + '</td>' +
+                '<td>' + escapeHtml(formatNumber(point.delta)) + '</td>' +
+                '<td>' + escapeHtml(formatNumber(point.reference)) + '</td>' +
+                '<td>' + escapeHtml(formatNumber(point.deviation)) + '</td>' +
+                '<td>' + escapeHtml(formatNumber(point.score)) + '</td>' +
+                '</tr>';
+        });
+
+        table.innerHTML = html + '</tbody></table>';
     }
 })();
