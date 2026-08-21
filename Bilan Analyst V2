@@ -249,9 +249,139 @@ function drawPareto(data){
     if(!chart){chart=new Chart(document.getElementById("ayParetoCanvas").getContext("2d"),{type:"bar",data:{labels:labels,datasets:[{data:values,backgroundColor:colors,borderRadius:5}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{beginAtZero:true,grid:{color:"#edf1f5"},ticks:{callback:function(v){return formatNumber(Number(v));}}},y:{grid:{display:false}}},plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){var pct=data.grandTotal?c.parsed.x/data.grandTotal*100:0;return formatNumber(c.parsed.x)+" | "+formatNumber(pct)+" %";}}}}}});}else{chart.data.labels=labels;chart.data.datasets[0].data=values;chart.data.datasets[0].backgroundColor=colors;chart.update("none");}
 }
 function drawProfile(){
-    var buckets=[];for(var h=0;h<24;h++)buckets.push([]);allValidPoints().forEach(function(x){buckets[x.point.date.getHours()].push(x.point.delta);});
-    var labels=[],values=[];for(var i=0;i<24;i++){labels.push(String(i).padStart(2,"0")+"h");var vals=buckets[i];values.push(vals.length?vals.reduce(function(a,b){return a+b;},0)/vals.length:0);}
-    if(!hourChart){hourChart=new Chart(document.getElementById("ayProfileCanvas").getContext("2d"),{type:"line",data:{labels:labels,datasets:[{data:values,borderColor:"#149fe3",backgroundColor:"#149fe322",fill:true,tension:.25,pointRadius:3}]},options:{responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:"#edf1f5"}}},plugins:{legend:{display:false}}}});}else{hourChart.data.datasets[0].data=values;hourChart.update("none");}
+
+    var selectedSeries =
+        seriesList[selectedSeriesIndex];
+
+    if(!selectedSeries)
+        return;
+
+    var buckets = [];
+
+    for(var h=0; h<24; h++){
+        buckets.push([]);
+    }
+
+    validPointsForSeries(selectedSeries)
+        .forEach(function(p){
+
+            buckets[
+                p.date.getHours()
+            ].push(
+                p.delta
+            );
+
+        });
+
+    var labels = [];
+    var values = [];
+
+    for(var i=0; i<24; i++){
+
+        labels.push(
+            String(i)
+                .padStart(2,"0")
+                + "h"
+        );
+
+        var vals =
+            buckets[i];
+
+        values.push(
+            vals.length
+                ? vals.reduce(
+                    function(a,b){
+                        return a+b;
+                    },
+                    0
+                ) / vals.length
+                : 0
+        );
+    }
+
+    if(!hourChart){
+
+        hourChart =
+            new Chart(
+                document
+                    .getElementById(
+                        "ayProfileCanvas"
+                    )
+                    .getContext("2d"),
+                {
+                    type:"line",
+
+                    data:{
+                        labels:labels,
+
+                        datasets:[{
+                            label:
+                                selectedSeries.name,
+
+                            data:values,
+
+                            borderColor:
+                                selectedSeries.color,
+
+                            backgroundColor:
+                                selectedSeries.color +
+                                "22",
+
+                            fill:true,
+                            tension:.25,
+                            pointRadius:3
+                        }]
+                    },
+
+                    options:{
+                        responsive:true,
+                        maintainAspectRatio:false,
+                        animation:false,
+
+                        scales:{
+                            x:{
+                                grid:{
+                                    display:false
+                                }
+                            },
+                            y:{
+                                beginAtZero:true,
+                                grid:{
+                                    color:"#edf1f5"
+                                }
+                            }
+                        },
+
+                        plugins:{
+                            legend:{
+                                display:true
+                            }
+                        }
+                    }
+                }
+            );
+
+    }else{
+
+        hourChart.data.labels =
+            labels;
+
+        hourChart.data.datasets[0].label =
+            selectedSeries.name;
+
+        hourChart.data.datasets[0].data =
+            values;
+
+        hourChart.data.datasets[0].borderColor =
+            selectedSeries.color;
+
+        hourChart.data.datasets[0].backgroundColor =
+            selectedSeries.color + "22";
+
+        hourChart.update(
+            "none"
+        );
+    }
 }
 function renderRanking(data){
     var html='<table class="ay-table"><thead><tr><th>Usage</th><th>Total</th><th>Part</th><th>Anomalies</th></tr></thead><tbody>';
