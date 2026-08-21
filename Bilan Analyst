@@ -1,9 +1,9 @@
-/* ANALYST V5 - stackRoot > OnRender - cockpit energetique complet */
+/* ANALYST V6 - stackRoot > OnRender - aide a la decision energetique */
 var pageActor = this;
 var html1 = context.getActor("html1");
 
 if (!html1) { console.error("Analyst : acteur html1 introuvable."); return; }
-console.log("Analyst V5 : demarrage");
+console.log("Analyst V6 : demarrage");
 
 var ENERGY_SCAN_ROOT = pageActor.stage && pageActor.stage.additionals && pageActor.stage.additionals.bilan
     ? pageActor.stage.additionals.bilan : ":easy.RESS";
@@ -285,7 +285,7 @@ function showEmpty(msg){setText("ayTotal","0");setText("ayTopShare","0 %");setTe
 function setLoading(text){setText("analystLoadingBadge",text);}
 function setStatus(text,color){setText("ayStatusText",text);var e=document.getElementById("ayStatusText");if(e)e.style.color=color;}
 function showRuntimeError(error){console.error("Analyst :",error);setLoading("Erreur de chargement");setStatus("Erreur : "+getError(error),"#ef4444");}
-function showFatal(error){console.error(error);html1.properties.content='<div style="margin:20px;padding:18px;border:1px solid #fecaca;border-radius:12px;color:#991b1b;background:#fff1f2"><h2>Erreur Analyst V5</h2><pre>'+escapeHtml(getError(error))+'</pre></div>';}
+function showFatal(error){console.error(error);html1.properties.content='<div style="margin:20px;padding:18px;border:1px solid #fecaca;border-radius:12px;color:#991b1b;background:#fff1f2"><h2>Erreur Analyst V6</h2><pre>'+escapeHtml(getError(error))+'</pre></div>';}
 function median(values){if(!values.length)return 0;var s=values.slice().sort(function(a,b){return a-b;}),m=Math.floor(s.length/2);return s.length%2?s[m]:(s[m-1]+s[m])/2;}
 function startOfDay(d){return new Date(d.getFullYear(),d.getMonth(),d.getDate(),0,0,0,0);}
 function addDays(d,n){var r=new Date(d.getTime());r.setDate(r.getDate()+n);return r;}
@@ -762,4 +762,215 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
         var blob=new Blob(["\uFEFF"+csv],{type:"text/csv;charset=utf-8"});
         var url=URL.createObjectURL(blob);var a=document.createElement("a");a.href=url;a.download="Analyst_V5_"+new Date().toISOString().slice(0,10)+".csv";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
     }
+})();
+
+/* ANALYST V6 - AIDE A LA DECISION
+ * Cout, projection annuelle, derives, timeline, actions prioritaires et mode Direction.
+ */
+(function installAnalystV6Decision(){
+    "use strict";
+
+    if(typeof injectHtml!=="function"||typeof bindEvents!=="function"||typeof renderDashboard!=="function"){
+        console.error("Analyst V6 : fonctions V5 introuvables.");
+        return;
+    }
+
+    var baseInjectHtmlV6=injectHtml;
+    var baseBindEventsV6=bindEvents;
+    var baseRenderDashboardV6=renderDashboard;
+    var energyPrice=readStoredPrice();
+    var displayMode="exploitant";
+
+    injectHtml=function(){
+        baseInjectHtmlV6();
+        var content=String(html1.properties.content||"");
+        content=content.replace("Analyst V5</div>","Analyst V6</div>");
+        content=content.replace("Cockpit energetique : usages, profils, anomalies et pilotage","Cockpit energetique : analyse, couts, derives et priorites");
+        content=addV6Css(content);
+        content=addV6Controls(content);
+        content=addV6DirectionTab(content);
+        html1.properties.content=content;
+    };
+
+    bindEvents=function(){
+        baseBindEventsV6();
+        var price=document.getElementById("ayV6Price");
+        if(price){
+            price.value=String(energyPrice).replace(".",",");
+            price.addEventListener("change",function(){
+                var parsed=parseNumberValue(price.value);
+                if(parsed!==null&&parsed>=0){energyPrice=parsed;storePrice(parsed);renderV6();}
+                price.value=String(energyPrice).replace(".",",");
+            });
+        }
+        var mode=document.getElementById("ayV6Mode");
+        if(mode)mode.addEventListener("change",function(){displayMode=mode.value;applyDisplayMode();renderV6();});
+        Array.prototype.forEach.call(document.querySelectorAll(".analyst-v3-tab"),function(button){
+            button.addEventListener("click",function(){if(button.getAttribute("data-tab")==="direction")window.requestAnimationFrame(renderV6);});
+        });
+        applyDisplayMode();
+    };
+
+    renderDashboard=function(){
+        baseRenderDashboardV6();
+        renderV6();
+    };
+
+    function readStoredPrice(){
+        try{var value=localStorage.getItem("analystEnergyPrice");var parsed=parseFloat(value);return isFinite(parsed)&&parsed>=0?parsed:.18;}catch(e){return .18;}
+    }
+    function storePrice(value){try{localStorage.setItem("analystEnergyPrice",String(value));}catch(e){console.warn("Analyst V6 : prix non memorise",e);}}
+
+    function addV6Css(content){
+        var css=[
+            ".ay-v6-config{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+            ".ay-v6-config label{color:#718198;font-size:9px;font-weight:650;text-transform:uppercase}",
+            ".ay-v6-input{width:92px;min-height:32px;padding:0 10px;border:1px solid #dce5ed;border-radius:16px;background:#fff;color:#10294d}",
+            ".ay-v6-select{min-height:32px;padding:0 10px;border:1px solid #dce5ed;border-radius:16px;background:#fff;color:#10294d}",
+            ".ay-v6-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px}",
+            ".ay-v6-kpi{padding:16px;border:1px solid #dce5ed;border-radius:12px;background:#fff}",
+            ".ay-v6-kpi.primary{border-left:4px solid #149fe3}",
+            ".ay-v6-kpi.warning{border-left:4px solid #f59e0b}",
+            ".ay-v6-kpi-label{color:#718198;font-size:9px;font-weight:700;text-transform:uppercase}",
+            ".ay-v6-kpi-value{margin-top:8px;color:#149fe3;font-size:25px;font-weight:750}",
+            ".ay-v6-kpi-meta{margin-top:5px;color:#718198;font-size:10px;line-height:1.4}",
+            ".ay-v6-columns{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}",
+            ".ay-v6-list{padding:12px 14px}",
+            ".ay-v6-item{display:grid;grid-template-columns:minmax(130px,1fr) 2fr auto;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid #edf1f5}",
+            ".ay-v6-item:last-child{border-bottom:0}",
+            ".ay-v6-name{font-size:10px;font-weight:700}",
+            ".ay-v6-bar{height:8px;border-radius:8px;background:#edf1f5;overflow:hidden}",
+            ".ay-v6-bar span{display:block;height:100%;border-radius:8px;background:#149fe3}",
+            ".ay-v6-delta{font-size:10px;font-weight:700}",
+            ".ay-v6-delta.up{color:#ef4444}.ay-v6-delta.down{color:#16a34a}",
+            ".ay-v6-timeline{padding:14px}",
+            ".ay-v6-event{position:relative;margin-left:9px;padding:0 0 16px 22px;border-left:2px solid #dce5ed}",
+            ".ay-v6-event:last-child{border-left-color:transparent}",
+            ".ay-v6-event:before{content:'';position:absolute;left:-6px;top:2px;width:10px;height:10px;border-radius:50%;background:#149fe3}",
+            ".ay-v6-event.warning:before{background:#f59e0b}.ay-v6-event.critical:before{background:#ef4444}",
+            ".ay-v6-event-title{font-size:10px;font-weight:700}",
+            ".ay-v6-event-meta{margin-top:3px;color:#718198;font-size:9px}",
+            ".ay-v6-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;padding:14px}",
+            ".ay-v6-action{padding:14px;border-radius:11px;background:#f7f9fb;border-top:4px solid #149fe3}",
+            ".ay-v6-action.warning{background:#fff8e7;border-top-color:#f59e0b}",
+            ".ay-v6-action.critical{background:#fff1f2;border-top-color:#ef4444}",
+            ".ay-v6-action-rank{color:#718198;font-size:8px;font-weight:700;text-transform:uppercase}",
+            ".ay-v6-action-title{margin-top:5px;font-size:12px;font-weight:750}",
+            ".ay-v6-action-text{margin-top:6px;color:#50637c;font-size:10px;line-height:1.45}",
+            ".ay-direction-only{display:none}",
+            "#analystDashboard.ay-mode-direction .ay-exploitant-only{display:none!important}",
+            "#analystDashboard.ay-mode-direction .ay-direction-only{display:block}",
+            "#analystDashboard.ay-mode-direction .ay-series-menu{display:none}",
+            "@media(max-width:1000px){.ay-v6-kpis{grid-template-columns:repeat(2,1fr)}.ay-v6-columns{grid-template-columns:1fr}.ay-v6-actions{grid-template-columns:1fr}}",
+            "@media(max-width:600px){.ay-v6-kpis{grid-template-columns:1fr}.ay-v6-item{grid-template-columns:1fr}.ay-v6-config{width:100%}}"
+        ].join("");
+        return content.replace("</style>",css+"</style>");
+    }
+
+    function addV6Controls(content){
+        var loading='<div class="ay-badge" id="analystLoadingBadge">Chargement</div>';
+        var replacement='<div class="ay-v6-config">'+
+            '<label for="ayV6Price">Prix energie</label><input id="ayV6Price" class="ay-v6-input" inputmode="decimal" value="0,18"><span class="ay-panel-subtitle">EUR/kWh</span>'+
+            '<label for="ayV6Mode">Mode</label><select id="ayV6Mode" class="ay-v6-select"><option value="exploitant">Exploitant</option><option value="direction">Direction</option></select>'+
+            loading+'</div>';
+        return content.replace(loading,replacement);
+    }
+
+    function addV6DirectionTab(content){
+        var pilotTab='<button class="analyst-v3-tab" type="button" data-tab="pilotage" role="tab">Pilotage</button>';
+        content=content.replace(pilotTab,pilotTab+'<button class="analyst-v3-tab" type="button" data-tab="direction" role="tab">Direction</button>');
+        var end=content.lastIndexOf("</div>");if(end<0)return content;
+        var view=[
+            '<div class="ay-v3-view" id="analystDirectionView" data-view="direction" hidden>',
+            '<div class="ay-v6-kpis">',
+            '<div class="ay-v6-kpi primary"><div class="ay-v6-kpi-label">Cout de la periode</div><div class="ay-v6-kpi-value" id="ayV6Cost">0 EUR</div><div class="ay-v6-kpi-meta" id="ayV6CostMeta">Prix configurable</div></div>',
+            '<div class="ay-v6-kpi"><div class="ay-v6-kpi-label">Projection annuelle</div><div class="ay-v6-kpi-value" id="ayV6AnnualEnergy">0</div><div class="ay-v6-kpi-meta" id="ayV6AnnualEnergyMeta">Extrapolation des jours disponibles</div></div>',
+            '<div class="ay-v6-kpi"><div class="ay-v6-kpi-label">Budget annuel projete</div><div class="ay-v6-kpi-value" id="ayV6AnnualCost">0 EUR</div><div class="ay-v6-kpi-meta">Projection au prix energie saisi</div></div>',
+            '<div class="ay-v6-kpi warning"><div class="ay-v6-kpi-label">Derive maximale</div><div class="ay-v6-kpi-value" id="ayV6MaxDrift">0 %</div><div class="ay-v6-kpi-meta" id="ayV6MaxDriftMeta">Premiere vs seconde moitie</div></div>',
+            '</div>',
+            '<div class="ay-v6-columns">',
+            '<div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title">Derives par usage</div><div class="ay-panel-subtitle">Evolution entre les deux moities de la periode selectionnee</div></div></div><div class="ay-v6-list" id="ayV6Drifts"></div></div>',
+            '<div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title">Timeline des evenements</div><div class="ay-panel-subtitle">Pics et anomalies tries chronologiquement</div></div></div><div class="ay-v6-timeline" id="ayV6Timeline"></div></div>',
+            '</div>',
+            '<div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title">Actions prioritaires</div><div class="ay-panel-subtitle">Synthese orientee decision a partir des donnees chargees</div></div><div class="ay-badge" id="ayV6ActionBadge">0 action</div></div><div class="ay-v6-actions" id="ayV6Actions"></div></div>',
+            '</div>'
+        ].join("");
+        return content.substring(0,end)+view+content.substring(end);
+    }
+
+    function applyDisplayMode(){
+        var root=document.getElementById("analystDashboard");if(!root)return;
+        root.classList.toggle("ay-mode-direction",displayMode==="direction");
+        if(displayMode==="direction"){
+            var directionTab=document.querySelector('.analyst-v3-tab[data-tab="direction"]');
+            if(directionTab)directionTab.click();
+        }
+    }
+
+    function renderV6(){
+        var view=document.getElementById("analystDirectionView");if(!view||!seriesList.length)return;
+        var data=computeInsights();
+        var days=countCoveredDays(data.allPoints);
+        var dailyAverage=days?data.grandTotal/days:0;
+        var annualEnergy=dailyAverage*365;
+        var cost=data.grandTotal*energyPrice;
+        var annualCost=annualEnergy*energyPrice;
+        var drifts=computeSeriesDrifts();
+        var maxDrift=drifts.length?drifts.slice().sort(function(a,b){return b.drift-a.drift;})[0]:null;
+        setText("ayV6Cost",formatCurrency(cost));
+        setText("ayV6CostMeta",formatNumber(data.grandTotal)+" kWh x "+formatNumber(energyPrice)+" EUR/kWh");
+        setText("ayV6AnnualEnergy",formatNumber(annualEnergy)+" kWh");
+        setText("ayV6AnnualEnergyMeta","Extrapolation de "+days+" jour(s) couvert(s)");
+        setText("ayV6AnnualCost",formatCurrency(annualCost));
+        setText("ayV6MaxDrift",maxDrift?(maxDrift.drift>=0?"+":"")+formatNumber(maxDrift.drift)+" %":"0 %");
+        setText("ayV6MaxDriftMeta",maxDrift?maxDrift.series.name:"Donnees insuffisantes");
+        renderDrifts(drifts);
+        renderTimeline(data);
+        renderPriorityActions(data,drifts,cost);
+    }
+
+    function countCoveredDays(points){
+        var seen={};points.forEach(function(x){seen[formatDay(x.point.date)]=true;});return Object.keys(seen).length;
+    }
+
+    function computeSeriesDrifts(){
+        return seriesList.map(function(series){
+            var points=validPointsForSeries(series).slice().sort(function(a,b){return a.timestamp-b.timestamp;});
+            if(points.length<2)return {series:series,first:0,second:0,drift:0,valid:false};
+            var mid=points[Math.floor(points.length/2)].timestamp,first=0,second=0;
+            points.forEach(function(p){if(p.timestamp<mid)first+=p.delta;else second+=p.delta;});
+            return {series:series,first:first,second:second,drift:first?(second-first)/first*100:0,valid:first>0};
+        }).filter(function(x){return x.valid;}).sort(function(a,b){return b.drift-a.drift;});
+    }
+
+    function renderDrifts(drifts){
+        var box=document.getElementById("ayV6Drifts");if(!box)return;
+        if(!drifts.length){box.innerHTML='<div class="ay-empty">Donnees insuffisantes pour calculer les derives.</div>';return;}
+        var max=Math.max.apply(Math,drifts.map(function(x){return Math.abs(x.drift);}));
+        box.innerHTML=drifts.map(function(x){var width=max?Math.abs(x.drift)/max*100:0;return '<div class="ay-v6-item"><div class="ay-v6-name"><span class="ay-dot" style="background:'+x.series.color+'"></span>'+escapeHtml(x.series.name)+'</div><div class="ay-v6-bar"><span style="width:'+width+'%;background:'+x.series.color+'"></span></div><div class="ay-v6-delta '+(x.drift>0?'up':'down')+'">'+(x.drift>=0?'+':'')+escapeHtml(formatNumber(x.drift))+' %</div></div>';}).join("");
+    }
+
+    function renderTimeline(data){
+        var box=document.getElementById("ayV6Timeline");if(!box)return;
+        var events=data.anomalies.slice(0,15).map(function(x){return {date:x.point.date,title:(x.point.severity==="critical"?"Anomalie critique":"Anomalie a surveiller")+" - "+x.series.name,meta:"Valeur "+formatNumber(x.point.delta)+", score "+formatNumber(x.point.score),level:x.point.severity};});
+        if(data.peak)events.push({date:data.peak.point.date,title:"Pic global - "+data.peak.series.name,meta:"Valeur "+formatNumber(data.peak.point.delta),level:""});
+        events.sort(function(a,b){return b.date-a.date;});
+        if(!events.length){box.innerHTML='<div class="ay-empty">Aucun evenement prioritaire sur la periode.</div>';return;}
+        box.innerHTML=events.slice(0,12).map(function(e){return '<div class="ay-v6-event '+e.level+'"><div class="ay-v6-event-title">'+escapeHtml(e.title)+'</div><div class="ay-v6-event-meta">'+escapeHtml(formatDate(e.date))+' | '+escapeHtml(e.meta)+'</div></div>';}).join("");
+    }
+
+    function renderPriorityActions(data,drifts,cost){
+        var box=document.getElementById("ayV6Actions");if(!box)return;
+        var actions=[];
+        var nightShare=data.grandTotal?data.overnight/data.grandTotal*100:0;
+        if(nightShare>=15)actions.push({title:"Reduire les consommations nocturnes",text:formatNumber(nightShare)+" % de la consommation est observee entre 22h et 06h. Verifier horaires, veilles et arrets.",level:nightShare>=25?"critical":"warning"});
+        if(data.top){var share=data.grandTotal?data.top.total/data.grandTotal*100:0;actions.push({title:"Prioriser "+data.top.series.name,text:"Cet usage represente "+formatNumber(share)+" % de la consommation et environ "+formatCurrency(data.top.total*energyPrice)+" sur la periode.",level:share>=50?"warning":""});}
+        if(drifts.length&&drifts[0].drift>=10)actions.push({title:"Analyser la derive de "+drifts[0].series.name,text:"La seconde moitie de la periode est superieure de "+formatNumber(drifts[0].drift)+" % a la premiere.",level:drifts[0].drift>=25?"critical":"warning"});
+        if(data.anomalies.length)actions.push({title:"Traiter les anomalies",text:data.anomalies.length+" intervalle(s) depassent les seuils. Commencer par "+data.anomalies[0].series.name+" le "+formatDate(data.anomalies[0].point.date)+".",level:data.anomalies[0].point.severity});
+        if(!actions.length)actions.push({title:"Maintenir la surveillance",text:"Aucune priorite forte n est detectee avec les seuils actuels. Continuer le suivi periodique.",level:""});
+        setText("ayV6ActionBadge",actions.length+" action(s)");
+        box.innerHTML=actions.slice(0,6).map(function(x,i){return '<div class="ay-v6-action '+x.level+'"><div class="ay-v6-action-rank">Priorite '+(i+1)+'</div><div class="ay-v6-action-title">'+escapeHtml(x.title)+'</div><div class="ay-v6-action-text">'+escapeHtml(x.text)+'</div></div>';}).join("");
+    }
+
+    function formatCurrency(value){return isFinite(value)?Number(value).toLocaleString("fr-FR",{style:"currency",currency:"EUR",maximumFractionDigits:0}):"N/A";}
 })();
