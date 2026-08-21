@@ -1,0 +1,289 @@
+/* ANALYST V2 - stackRoot > OnRender */
+var pageActor = this;
+var html1 = context.getActor("html1");
+
+if (!html1) { console.error("Analyst : acteur html1 introuvable."); return; }
+console.log("Analyst V2 : demarrage");
+
+var ENERGY_SCAN_ROOT = pageActor.stage && pageActor.stage.additionals && pageActor.stage.additionals.bilan
+    ? pageActor.stage.additionals.bilan : ":easy.RESS";
+var BILAN_CLASS = 331;
+var DAILY_CLASS = 73;
+var WARNING_SCORE = 3;
+var CRITICAL_SCORE = 5;
+var MIN_REFERENCE_COUNT = 3;
+var COLORS = ["#149fe3","#16a34a","#f59e0b","#8b5cf6","#ef4444","#06b6d4","#ec4899","#84cc16","#64748b","#a16207"];
+
+var bilans = [], dailyFiles = [], seriesList = [], mergedRows = [];
+var selectedBilanPath = "", selectedPeriod = "7days", periodShift = 0;
+var selectedSeriesIndex = 0, selectedAnomalyIndex = 0;
+var chart = null, hourChart = null, loadGeneration = 0;
+
+html1.properties.content = '<div style="padding:20px;font-family:Segoe UI,Arial;color:#718198;background:#f7f9fb"><div style="padding:18px;border:1px solid #dce5ed;border-radius:12px;background:#fff"><b style="color:#10294d">Detection anomalies</b><div style="margin-top:8px">Recherche des ressources Bilan REDY...</div></div></div>';
+initialize().catch(showFatal);
+
+async function initialize() {
+    if (typeof Chart === "undefined") throw new Error("Chart.js n'est pas disponible.");
+    bilans = await scanBilans();
+    if (!bilans.length) throw new Error("Aucune ressource Bilan de classe 331 trouvee sous " + ENERGY_SCAN_ROOT + ".");
+    bilans.sort(function(a,b){ return String(a.name||a.path||"").localeCompare(String(b.name||b.path||""),"fr",{numeric:true,sensitivity:"base"}); });
+    injectHtml();
+    await waitForElement("analystDashboard",50);
+    bindEvents();
+    var select = document.getElementById("analystBilanSelect");
+    if (select.options.length > 1) {
+        select.selectedIndex = 1;
+        selectedBilanPath = select.value;
+        await handleBilanChange();
+    } else {
+        setStatus("Aucun Bilan disponible", "#ef4444");
+        setLoading("Aucun Bilan disponible");
+    }
+}
+
+async function scanBilans() {
+    var redy = pageActor.dataStores && pageActor.dataStores.redy;
+    if (!redy) throw new Error("Datastore REDY indisponible.");
+    var fn = typeof redy._searchWosVariables === "function" ? redy._searchWosVariables.bind(redy) : redy.searchWosVariables.bind(redy);
+    var result = await fn({path:ENERGY_SCAN_ROOT,isClasses:[BILAN_CLASS],depth:0,take:0});
+    return result && Array.isArray(result.variables) ? result.variables : [];
+}
+async function searchDailyFiles(path) {
+    var result = await pageActor.dataStores.redy.searchWosVariables({path:path,isClasses:[DAILY_CLASS],depth:0,take:0});
+    var resources = result && Array.isArray(result.variables) ? result.variables : [];
+    return resources.map(function(resource){ return {resource:resource,date:parseDailyResourceDate(resource)}; })
+        .filter(function(item){ return item.resource && item.resource.path && item.date; })
+        .sort(function(a,b){ return a.date-b.date; });
+}
+async function loadDailyFile(item) {
+    var loaded = await pageActor.dataStores.redy.loadWosVariable(item.resource.path,{withBlob:true});
+    if (!loaded || loaded.value === undefined || loaded.value === null || loaded.value === "") throw new Error("Blob absent : " + item.resource.path);
+    var parsed = parseDailyContent(decodeBase64(loaded.value), item.resource);
+    return {resource:item.resource,resourceDate:item.date,headers:parsed.headers,rows:parsed.rows};
+}
+async function handleBilanChange() {
+    var generation = ++loadGeneration;
+    selectedBilanPath = document.getElementById("analystBilanSelect").value;
+    clearData();
+    if (!selectedBilanPath) { setLoading("Choisissez un Bilan"); setStatus("En attente de selection","#149fe3"); return; }
+    setLoading("Recherche des Bilans quotidiens...");
+    dailyFiles = await searchDailyFiles(selectedBilanPath);
+    if (generation !== loadGeneration) return;
+    if (!dailyFiles.length) throw new Error("Aucun fichier quotidien de classe 73 dans ce Bilan.");
+    selectedPeriod = "7days"; periodShift = 0; selectedSeriesIndex = 0; selectedAnomalyIndex = 0;
+    updatePeriodButtons();
+    await loadPeriod();
+}
+function firstDay(){ return dailyFiles.length ? startOfDay(dailyFiles[0].date) : null; }
+function lastDay(){ return dailyFiles.length ? startOfDay(dailyFiles[dailyFiles.length-1].date) : null; }
+function periodDays(){ return selectedPeriod === "30days" ? 30 : (selectedPeriod === "today" || selectedPeriod === "yesterday" ? 1 : 7); }
+function selectedRange(){
+    var first=firstDay(), last=lastDay(); if(!first||!last) return null;
+    if(selectedPeriod==="all") return {start:first,end:addDays(last,1),label:formatDay(first)+" -> "+formatDay(last)};
+    var days=periodDays(), base=selectedPeriod==="yesterday"?-1:0;
+    var end=addDays(addDays(last,1),base+periodShift*days), start=addDays(end,-days);
+    return {start:start,end:end,label:formatDay(start)+" -> "+formatDay(addDays(end,-1))};
+}
+function filesForRange(range){
+    var selected=[];
+    dailyFiles.forEach(function(item,index){ var t=item.date.getTime(); if(t>=range.start.getTime()&&t<range.end.getTime()) selected.push({item:item,index:index}); });
+    if(selected.length && selected[0].index>0) selected.unshift({item:dailyFiles[selected[0].index-1],index:selected[0].index-1,preceding:true});
+    return selected;
+}
+async function loadPeriod(){
+    var generation=++loadGeneration, range=selectedRange();
+    if(!range) throw new Error("Periode impossible a calculer.");
+    var files=filesForRange(range);
+    updatePeriodInfo(range,0);
+    if(!files.length){ clearData(); showEmpty("Aucun fichier quotidien pour cette periode."); return; }
+    setLoading("Chargement de "+files.length+" fichier(s)...");
+    var parsed=[];
+    for(var i=0;i<files.length;i++){
+        if(generation!==loadGeneration) return;
+        try { parsed.push(await loadDailyFile(files[i].item)); }
+        catch(error){ console.warn("Analyst : fichier ignore",files[i].item.resource.path,error); }
+    }
+    if(generation!==loadGeneration) return;
+    if(!parsed.length) throw new Error("Aucun fichier quotidien n'a pu etre charge.");
+    var merged=mergeDailyFiles(parsed), built=buildSeriesFromIndexes(merged);
+    built.forEach(function(s){ scoreAnomalies(s.points); s.points=s.points.filter(function(p){ return p.timestamp>=range.start.getTime()&&p.timestamp<range.end.getTime(); }); });
+    built=built.filter(function(s){ return s.points.some(function(p){ return p.validDelta; }); });
+    if(!built.length) throw new Error("Aucune consommation calculable apres fusion des index.");
+    mergedRows=merged.rows; seriesList=built; selectedSeriesIndex=0; selectedAnomalyIndex=0;
+    renderSeriesButtons(); renderDashboard(); updatePeriodInfo(range,parsed.length); setLoading("Pret");
+}
+
+function decodeBase64(value){
+    var binary=atob(value);
+    try { var bytes=new Uint8Array(binary.length); for(var i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i); if(typeof TextDecoder!=="undefined") return new TextDecoder("utf-8").decode(bytes); }
+    catch(error){ console.warn(error); }
+    return binary;
+}
+function normalizeText(value){ return String(value===undefined||value===null?"":value).replace(/^\uFEFF/,"").replace(/\u00a0/g," ").replace(/\r/g,"").trim(); }
+function parseNumberValue(value){
+    var text=normalizeText(value).replace(/\s/g,""); if(!text) return null;
+    if(text.indexOf(",")!==-1&&text.indexOf(".")!==-1){ text=text.lastIndexOf(",")>text.lastIndexOf(".")?text.replace(/\./g,"").replace(",", "."):text.replace(/,/g,""); }
+    else text=text.replace(",", ".");
+    text=text.replace(/[^0-9+\-.]/g,""); var number=parseFloat(text); return isFinite(number)?number:null;
+}
+function parseDataDate(value){
+    var text=normalizeText(value).replace(/<[^>]*>/g,"").trim(); if(!text) return null;
+    var parts=text.split(/\s+/); if(parts.length<2) return null;
+    var d=parts[0].replace(/-/g,"/").split("/"), t=parts[1].split(":"); if(d.length!==3||t.length<2) return null;
+    var day=parseInt(d[0],10), month=parseInt(d[1],10), year=parseInt(d[2],10), hour=parseInt(t[0],10), minute=parseInt(t[1],10), second=t.length>=3?parseInt(t[2],10):0;
+    if(year<100) year=year<=79?2000+year:1900+year;
+    var date=new Date(year,month-1,day,hour,minute,second,0);
+    return date.getFullYear()===year&&date.getMonth()===month-1&&date.getDate()===day&&date.getHours()===hour&&date.getMinutes()===minute?date:null;
+}
+function parseDailyResourceDate(resource){
+    var text=String(resource&&resource.name?resource.name:"")+" "+String(resource&&resource.path?resource.path:"");
+    var marker=text.lastIndexOf(".D"); text=marker>=0?text.substring(marker+2):text.substring(text.lastIndexOf("D")+1);
+    var digits=""; for(var i=0;i<text.length;i++){ var c=text.charAt(i); if(c>="0"&&c<="9") digits+=c; else break; }
+    var y,m,d;
+    if(digits.length>=8){ y=parseInt(digits.substring(0,4),10); m=parseInt(digits.substring(4,6),10); d=parseInt(digits.substring(6,8),10); }
+    else if(digits.length>=6){ y=parseInt(digits.substring(0,2),10); y=y<=79?2000+y:1900+y; m=parseInt(digits.substring(2,4),10); d=parseInt(digits.substring(4,6),10); }
+    else return null;
+    var date=new Date(y,m-1,d); return date.getFullYear()===y&&date.getMonth()===m-1&&date.getDate()===d?date:null;
+}
+function detectSeparator(lines){
+    var candidates=["\t",";","|"], best="\t", count=1;
+    for(var i=0;i<Math.min(lines.length,8);i++) candidates.forEach(function(s){ var n=lines[i].split(s).length; if(n>count){count=n;best=s;} });
+    return best;
+}
+function parseDailyContent(content,resource){
+    var lines=String(content||"").replace(/^\uFEFF/,"").replace(/<\/?(?:html|body)[^>]*>/gi,"").replace(/\r\n/g,"\n").replace(/\r/g,"\n").split("\n").map(normalizeText).filter(function(l){return l!=="";});
+    if(!lines.length) throw new Error("Fichier Bilan vide.");
+    var sep=detectSeparator(lines), first=lines[0].split(sep).map(normalizeText), firstDate=parseDataDate(first[0]), headers=[], start=0;
+    if(firstDate){ for(var i=1;i<first.length;i++) headers.push("Mesure "+i); }
+    else { start=1; headers=first.slice(); if(headers.length&&(headers[0].toLowerCase().indexOf("date")!==-1||headers[0].toLowerCase().indexOf("heure")!==-1)) headers=headers.slice(1); }
+    var rows=[];
+    for(var n=start;n<lines.length;n++){
+        var cols=lines[n].split(sep).map(normalizeText); if(cols.length<2) continue;
+        var date=parseDataDate(cols[0]); if(!date) continue;
+        rows.push({dateText:cols[0],date:date,timestamp:date.getTime(),values:cols.slice(1).map(parseNumberValue),resourceName:resource.name||"",resourcePath:resource.path||""});
+    }
+    if(!rows.length) throw new Error("Aucune date reconnue dans "+(resource.name||resource.path||"le Bilan")+".");
+    var max=0; rows.forEach(function(r){max=Math.max(max,r.values.length);}); while(headers.length>max) headers.shift(); while(headers.length<max) headers.push("Mesure "+(headers.length+1));
+    return {headers:headers,rows:rows};
+}
+function mergeDailyFiles(files){
+    var headers=[], lookup={}; files.forEach(function(f){if(f.headers.length>headers.length) headers=f.headers.slice(); f.rows.forEach(function(r){lookup[r.timestamp]=r;});});
+    var rows=Object.keys(lookup).map(function(k){return lookup[k];}).sort(function(a,b){return a.timestamp-b.timestamp;});
+    var max=0; rows.forEach(function(r){max=Math.max(max,r.values.length);}); while(headers.length<max) headers.push("Mesure "+(headers.length+1));
+    return {headers:headers,rows:rows};
+}
+function buildSeriesFromIndexes(merged){
+    return merged.headers.map(function(header,col){
+        var points=[];
+        merged.rows.forEach(function(row){ var v=row.values[col]; if(v!==null&&v!==undefined&&isFinite(v)) points.push({indexValue:v,delta:null,date:row.date,timestamp:row.timestamp,label:row.dateText,duration:null,validDelta:false,resetDetected:false,gapDetected:false,reference:null,deviation:null,score:0,severity:"normal"}); });
+        points.sort(function(a,b){return a.timestamp-b.timestamp;});
+        for(var i=1;i<points.length;i++){
+            var p=points[i], prev=points[i-1]; p.duration=p.timestamp-prev.timestamp; var delta=p.indexValue-prev.indexValue;
+            if(delta<0){p.resetDetected=true;continue;} p.delta=delta;p.validDelta=true;
+        }
+        var durations=points.map(function(p){return p.duration;}).filter(function(v){return v>0;}), normal=median(durations);
+        points.forEach(function(p){p.gapDetected=normal>0&&p.duration!==null&&p.duration>normal*1.5;});
+        return {name:header||("Mesure "+(col+1)),color:COLORS[col%COLORS.length],points:points};
+    });
+}
+
+function scoreAnomalies(points){
+    var buckets=[]; for(var h=0;h<24;h++) buckets.push([]);
+    points.forEach(function(p){if(p.validDelta&&p.delta!==null&&isFinite(p.delta)&&p.delta>=0) buckets[p.date.getHours()].push(p.delta);});
+    var profiles=buckets.map(function(values){var center=median(values),mad=median(values.map(function(v){return Math.abs(v-center);}));return {median:center,mad:mad,count:values.length};});
+    points.forEach(function(p){
+        if(!p.validDelta||p.delta===null||!isFinite(p.delta)||p.delta<0)return;
+        var ref=profiles[p.date.getHours()];p.reference=ref.median;p.deviation=p.delta-ref.median;
+        if(ref.count<MIN_REFERENCE_COUNT){p.score=0;p.severity="normal";return;}
+        var scale=Math.max(ref.mad*1.4826,Math.abs(ref.median)*0.15,0.01);p.score=Math.abs(p.deviation)/scale;
+        p.severity=p.score>=CRITICAL_SCORE?"critical":(p.score>=WARNING_SCORE?"warning":"normal");
+    });
+}
+function validPointsForSeries(s){return s?s.points.filter(function(p){return p.validDelta&&p.delta!==null&&isFinite(p.delta)&&p.delta>=0;}):[];}
+function totalForSeries(s){return validPointsForSeries(s).reduce(function(sum,p){return sum+p.delta;},0);}
+function anomalyPointsForSeries(s){return validPointsForSeries(s).filter(function(p){return p.severity==="warning"||p.severity==="critical";});}
+function allValidPoints(){var out=[];seriesList.forEach(function(s){validPointsForSeries(s).forEach(function(p){out.push({series:s,point:p});});});return out;}
+function allAnomalies(){var out=[];seriesList.forEach(function(s){anomalyPointsForSeries(s).forEach(function(p){out.push({series:s,point:p});});});return out.sort(function(a,b){return b.point.score-a.point.score;});}
+function computeInsights(){
+    var totals=seriesList.map(function(s){return {series:s,total:totalForSeries(s),anomalies:anomalyPointsForSeries(s).length};}).sort(function(a,b){return b.total-a.total;});
+    var grand=totals.reduce(function(sum,x){return sum+x.total;},0), allPts=allValidPoints(), anomalies=allAnomalies();
+    var overnight=allPts.filter(function(x){var h=x.point.date.getHours();return h<6||h>=22;}).reduce(function(sum,x){return sum+x.point.delta;},0);
+    var peak=null;allPts.forEach(function(x){if(!peak||x.point.delta>peak.point.delta)peak=x;});
+    return {totals:totals,grandTotal:grand,allPoints:allPts,anomalies:anomalies,overnight:overnight,peak:peak,top:totals.length?totals[0]:null};
+}
+
+function injectHtml(){
+    var options='<option value="">Selectionner un Bilan...</option>';
+    bilans.forEach(function(r){options+='<option value="'+escapeHtml(r.path||"")+'">'+escapeHtml(r.name||r.path||"Bilan")+'</option>';});
+    html1.properties.content=`
+<div id="analystDashboard">
+<style>
+#analystDashboard,#analystDashboard *{box-sizing:border-box}#analystDashboard{width:100%;min-height:100%;padding:18px;background:#f7f9fb;color:#10294d;font-family:"Segoe UI",Arial,sans-serif}.ay-header,.ay-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}.ay-brand{display:flex;align-items:center;gap:11px}.ay-logo{width:42px;height:42px;display:grid;place-items:center;border-radius:12px;background:#eaf7fd;color:#087fc1;font-size:20px}.ay-title{font-size:22px;font-weight:700}.ay-subtitle,.ay-panel-subtitle,.ay-kpi-meta{color:#718198;font-size:10px}.ay-badges,.ay-presets,.ay-shift,.ay-series-menu{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.ay-badge,.ay-period-label{padding:7px 11px;border-radius:16px;background:#eaf7fd;color:#087fc1;font-size:10px}.ay-navigation{display:grid;grid-template-columns:minmax(0,auto) minmax(0,1fr);gap:12px;align-items:center;padding:10px 12px;margin-bottom:14px;border:1px solid #dce5ed;border-radius:12px;background:#fff}.ay-shift{justify-content:flex-end}.ay-select{min-width:230px;min-height:34px;padding:0 12px;border:1px solid #dce5ed;border-radius:17px;background:#fff}.analyst-period-button,.ay-shift-button,.analyst-series-button{min-height:32px;padding:0 12px;border:1px solid #dce5ed;border-radius:17px;background:#fff;color:#718198;cursor:pointer}.analyst-period-button.active{background:#149fe3;color:#fff;border-color:#149fe3}.analyst-series-button{display:flex;align-items:center;gap:7px}.analyst-series-button.active{color:var(--series-color);border-color:var(--series-color);background:#eef8fd;font-weight:650}.analyst-series-dot{width:8px;height:8px;border-radius:50%;background:var(--series-color)}.ay-kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:14px}.ay-kpi{padding:15px;border:1px solid #dce5ed;border-radius:12px;background:#fff}.ay-kpi:first-child{border-left:4px solid #149fe3}.ay-kpi-label{color:#718198;font-size:9px;font-weight:650;text-transform:uppercase}.ay-kpi-value{margin-top:9px;color:#149fe3;font-size:26px;font-weight:700}.ay-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(300px,.8fr);gap:12px;margin-bottom:14px;align-items:start}.ay-panel{border:1px solid #dce5ed;border-radius:13px;background:#fff;overflow:hidden}.ay-panel-header{min-height:54px;padding:11px 14px;border-bottom:1px solid #dce5ed;display:flex;align-items:center;justify-content:space-between;gap:10px}.ay-panel-title{font-size:13px;font-weight:650}.ay-chart{height:330px;padding:14px}.ay-chart canvas{width:100%!important;height:100%!important}.ay-insights{padding:14px}.ay-insight{padding:12px;margin-bottom:9px;border-radius:10px;background:#f7f9fb;border-left:4px solid #149fe3}.ay-insight.warning{background:#fff8e7;border-left-color:#f59e0b}.ay-insight.critical{background:#fff1f2;border-left-color:#ef4444}.ay-insight-title{font-size:11px;font-weight:650}.ay-insight-text{margin-top:5px;color:#50637c;font-size:10px;line-height:1.45}.ay-table{width:100%;border-collapse:collapse}.ay-table th,.ay-table td{padding:10px 12px;border-bottom:1px solid #edf1f5;text-align:left;font-size:10px}.ay-table th{color:#718198;text-transform:uppercase;font-size:8px}.ay-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px}.ay-status{padding:12px 14px;color:#087fc1;background:#eaf7fd;font-size:10px}@media(max-width:1100px){.ay-navigation,.ay-grid{grid-template-columns:1fr}.ay-shift{justify-content:flex-start}.ay-kpis{grid-template-columns:repeat(3,1fr)}}@media(max-width:760px){.ay-kpis{grid-template-columns:repeat(2,1fr)}}@media(max-width:480px){.ay-kpis{grid-template-columns:1fr}}
+</style>
+<div class="ay-header"><div class="ay-brand"><div class="ay-logo">A</div><div><div class="ay-title">Analyst V2</div><div class="ay-subtitle">Synthese energetique, priorites et recommandations automatiques</div></div></div><div class="ay-badges"><div class="ay-badge" id="analystRowBadge">0 index</div><div class="ay-badge" id="analystFileBadge">0 fichier</div><div class="ay-badge" id="analystSourceBadge">Chargement...</div></div></div>
+<div class="ay-navigation"><div class="ay-presets"><label>Bilan</label><select id="analystBilanSelect" class="ay-select">${options}</select><button class="analyst-period-button" data-period="today">Aujourd'hui</button><button class="analyst-period-button" data-period="yesterday">Hier</button><button class="analyst-period-button active" data-period="7days">7 jours</button><button class="analyst-period-button" data-period="30days">30 jours</button><button class="analyst-period-button" data-period="all">Toute la periode</button></div><div class="ay-shift"><button class="ay-shift-button" id="analystPreviousPeriod">‹ Periode precedente</button><div class="ay-period-label" id="analystPeriodLabel">Chargement</div><button class="ay-shift-button" id="analystNextPeriod">Periode suivante ›</button></div></div>
+<div class="ay-toolbar"><div class="ay-series-menu" id="analystSeriesMenu"></div><div class="ay-badge" id="analystLoadingBadge">Chargement</div></div>
+<div class="ay-kpis"><div class="ay-kpi"><div class="ay-kpi-label">Consommation totale</div><div class="ay-kpi-value" id="ayTotal">0</div><div class="ay-kpi-meta" id="ayTotalMeta">Toutes les series</div></div><div class="ay-kpi"><div class="ay-kpi-label">Usage principal</div><div class="ay-kpi-value" id="ayTopShare">0 %</div><div class="ay-kpi-meta" id="ayTopName">Aucun usage</div></div><div class="ay-kpi"><div class="ay-kpi-label">Anomalies</div><div class="ay-kpi-value" id="ayAnomalies">0</div><div class="ay-kpi-meta" id="ayAnomalyRate">0 % des intervalles</div></div><div class="ay-kpi"><div class="ay-kpi-label">Consommation nocturne</div><div class="ay-kpi-value" id="ayNightShare">0 %</div><div class="ay-kpi-meta">22h-06h</div></div><div class="ay-kpi"><div class="ay-kpi-label">Pic global</div><div class="ay-kpi-value" id="ayPeak">0</div><div class="ay-kpi-meta" id="ayPeakMeta">Aucun pic</div></div></div>
+<div class="ay-grid"><div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title">Pareto des usages</div><div class="ay-panel-subtitle">Consommation totale par serie sur la periode</div></div><div class="ay-badge" id="ayParetoBadge">0 usage</div></div><div class="ay-chart"><canvas id="ayParetoCanvas"></canvas></div></div><div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title">Analyse automatique</div><div class="ay-panel-subtitle">Priorites issues des donnees chargees</div></div></div><div class="ay-insights" id="ayInsights"></div><div class="ay-status" id="ayStatusText">Chargement de l'analyse...</div></div></div>
+<div class="ay-grid"><div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title">Profil horaire global</div><div class="ay-panel-subtitle">Somme moyenne des consommations par heure</div></div></div><div class="ay-chart"><canvas id="ayProfileCanvas"></canvas></div></div><div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title">Classement des usages</div><div class="ay-panel-subtitle">Consommation, part et anomalies</div></div></div><div id="ayRanking"></div></div></div>
+</div>`;
+}
+
+function bindEvents(){
+    document.getElementById("analystBilanSelect").addEventListener("change",function(){handleBilanChange().catch(showRuntimeError);});
+    Array.prototype.forEach.call(document.querySelectorAll(".analyst-period-button"),function(b){b.addEventListener("click",function(){selectedPeriod=b.getAttribute("data-period");periodShift=0;updatePeriodButtons();loadPeriod().catch(showRuntimeError);});});
+    document.getElementById("analystPreviousPeriod").addEventListener("click",function(){if(selectedPeriod!=="all"){periodShift--;loadPeriod().catch(showRuntimeError);}});
+    document.getElementById("analystNextPeriod").addEventListener("click",function(){if(selectedPeriod!=="all"){periodShift++;loadPeriod().catch(showRuntimeError);}});
+}
+function renderSeriesButtons(){
+    var menu=document.getElementById("analystSeriesMenu");menu.innerHTML="";
+    seriesList.forEach(function(s,i){var b=document.createElement("button");b.className="analyst-series-button"+(i===selectedSeriesIndex?" active":"");b.style.setProperty("--series-color",s.color);b.innerHTML='<span class="analyst-series-dot"></span>'+escapeHtml(s.name);b.onclick=function(){selectedSeriesIndex=i;renderSeriesButtons();renderDashboard();};menu.appendChild(b);});
+}
+function renderDashboard(){
+    var data=computeInsights(),top=data.top,topShare=data.grandTotal&&top?top.total/data.grandTotal*100:0,anRate=data.allPoints.length?data.anomalies.length/data.allPoints.length*100:0,nightShare=data.grandTotal?data.overnight/data.grandTotal*100:0;
+    setText("ayTotal",formatNumber(data.grandTotal));setText("ayTotalMeta",data.allPoints.length+" intervalle(s) valide(s)");setText("ayTopShare",formatNumber(topShare)+" %");setText("ayTopName",top?top.series.name:"Aucun usage");setText("ayAnomalies",data.anomalies.length);setText("ayAnomalyRate",formatNumber(anRate)+" % des intervalles");setText("ayNightShare",formatNumber(nightShare)+" %");setText("ayPeak",data.peak?formatNumber(data.peak.point.delta):"0");setText("ayPeakMeta",data.peak?data.peak.series.name+" | "+formatDate(data.peak.point.date):"Aucun pic");setText("ayParetoBadge",data.totals.length+" usage(s)");
+    drawPareto(data);drawProfile();renderRanking(data);renderInsights(data);setText("ayStatusText","Analyse calculee a partir des deltas entre index horaires successifs.");
+}
+function drawPareto(data){
+    var labels=data.totals.map(function(x){return x.series.name;}),values=data.totals.map(function(x){return x.total;}),colors=data.totals.map(function(x){return x.series.color;});
+    if(!chart){chart=new Chart(document.getElementById("ayParetoCanvas").getContext("2d"),{type:"bar",data:{labels:labels,datasets:[{data:values,backgroundColor:colors,borderRadius:5}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{beginAtZero:true,grid:{color:"#edf1f5"},ticks:{callback:function(v){return formatNumber(Number(v));}}},y:{grid:{display:false}}},plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){var pct=data.grandTotal?c.parsed.x/data.grandTotal*100:0;return formatNumber(c.parsed.x)+" | "+formatNumber(pct)+" %";}}}}}});}else{chart.data.labels=labels;chart.data.datasets[0].data=values;chart.data.datasets[0].backgroundColor=colors;chart.update("none");}
+}
+function drawProfile(){
+    var buckets=[];for(var h=0;h<24;h++)buckets.push([]);allValidPoints().forEach(function(x){buckets[x.point.date.getHours()].push(x.point.delta);});
+    var labels=[],values=[];for(var i=0;i<24;i++){labels.push(String(i).padStart(2,"0")+"h");var vals=buckets[i];values.push(vals.length?vals.reduce(function(a,b){return a+b;},0)/vals.length:0);}
+    if(!hourChart){hourChart=new Chart(document.getElementById("ayProfileCanvas").getContext("2d"),{type:"line",data:{labels:labels,datasets:[{data:values,borderColor:"#149fe3",backgroundColor:"#149fe322",fill:true,tension:.25,pointRadius:3}]},options:{responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:"#edf1f5"}}},plugins:{legend:{display:false}}}});}else{hourChart.data.datasets[0].data=values;hourChart.update("none");}
+}
+function renderRanking(data){
+    var html='<table class="ay-table"><thead><tr><th>Usage</th><th>Total</th><th>Part</th><th>Anomalies</th></tr></thead><tbody>';
+    data.totals.forEach(function(x){var pct=data.grandTotal?x.total/data.grandTotal*100:0;html+='<tr><td><span class="ay-dot" style="background:'+x.series.color+'"></span>'+escapeHtml(x.series.name)+'</td><td>'+formatNumber(x.total)+'</td><td>'+formatNumber(pct)+' %</td><td>'+x.anomalies+'</td></tr>';});
+    document.getElementById("ayRanking").innerHTML=html+'</tbody></table>';
+}
+function renderInsights(data){
+    var box=document.getElementById("ayInsights"),html="";
+    if(data.top){var share=data.grandTotal?data.top.total/data.grandTotal*100:0;html+=insight("Usage prioritaire",data.top.series.name+" represente "+formatNumber(share)+" % de la consommation totale.",share>=50?"warning":"");}
+    var nightShare=data.grandTotal?data.overnight/data.grandTotal*100:0;html+=insight("Consommation nocturne",formatNumber(nightShare)+" % de la consommation est observee entre 22h et 06h.",nightShare>=25?"warning":"");
+    if(data.anomalies.length){var a=data.anomalies[0];html+=insight("Anomalie prioritaire",a.series.name+" le "+formatDate(a.point.date)+", score "+formatNumber(a.point.score)+".",a.point.severity==="critical"?"critical":"warning");}else{html+=insight("Anomalies","Aucune anomalie ne depasse les seuils configures sur la periode.","");}
+    if(data.peak)html+=insight("Pic global",data.peak.series.name+" atteint "+formatNumber(data.peak.point.delta)+" le "+formatDate(data.peak.point.date)+".","");
+    box.innerHTML=html;
+}
+function insight(title,text,level){return '<div class="ay-insight '+level+'"><div class="ay-insight-title">'+escapeHtml(title)+'</div><div class="ay-insight-text">'+escapeHtml(text)+'</div></div>';}
+function updatePeriodButtons(){Array.prototype.forEach.call(document.querySelectorAll(".analyst-period-button"),function(b){b.classList.toggle("active",b.getAttribute("data-period")===selectedPeriod);});}
+function updatePeriodInfo(range,fileCount){setText("analystPeriodLabel",range.label);setText("analystFileBadge",fileCount+" fichier(s)");setText("analystRowBadge",mergedRows.length+" index fusionne(s)");var s=document.getElementById("analystBilanSelect");setText("analystSourceBadge",s.options[s.selectedIndex].textContent);document.getElementById("analystPreviousPeriod").disabled=selectedPeriod==="all"||range.start.getTime()<=firstDay().getTime();document.getElementById("analystNextPeriod").disabled=selectedPeriod==="all"||range.end.getTime()>=addDays(lastDay(),1).getTime();}
+function clearData(){seriesList=[];mergedRows=[];selectedSeriesIndex=0;var m=document.getElementById("analystSeriesMenu");if(m)m.innerHTML="";if(chart){chart.data.labels=[];chart.data.datasets[0].data=[];chart.update();}if(hourChart){hourChart.data.datasets[0].data=[];hourChart.update();}}
+function showEmpty(msg){setText("ayTotal","0");setText("ayTopShare","0 %");setText("ayAnomalies","0");setText("ayNightShare","0 %");setText("ayPeak","0");setText("ayStatusText",msg);}
+function setLoading(text){setText("analystLoadingBadge",text);}
+function setStatus(text,color){setText("ayStatusText",text);var e=document.getElementById("ayStatusText");if(e)e.style.color=color;}
+function showRuntimeError(error){console.error("Analyst :",error);setLoading("Erreur de chargement");setStatus("Erreur : "+getError(error),"#ef4444");}
+function showFatal(error){console.error(error);html1.properties.content='<div style="margin:20px;padding:18px;border:1px solid #fecaca;border-radius:12px;color:#991b1b;background:#fff1f2"><h2>Erreur Analyst V2</h2><pre>'+escapeHtml(getError(error))+'</pre></div>';}
+function median(values){if(!values.length)return 0;var s=values.slice().sort(function(a,b){return a-b;}),m=Math.floor(s.length/2);return s.length%2?s[m]:(s[m-1]+s[m])/2;}
+function startOfDay(d){return new Date(d.getFullYear(),d.getMonth(),d.getDate(),0,0,0,0);}
+function addDays(d,n){var r=new Date(d.getTime());r.setDate(r.getDate()+n);return r;}
+function formatAxisLabel(d){if(selectedPeriod==="today"||selectedPeriod==="yesterday")return formatTime(d);if(selectedPeriod==="7days")return d.toLocaleString("fr-FR",{weekday:"short",hour:"2-digit"});return d.toLocaleString("fr-FR",{day:"2-digit",month:"2-digit",hour:"2-digit"});}
+function formatNumber(v){return isFinite(v)?Number(v).toLocaleString("fr-FR",{maximumFractionDigits:2}):"N/A";}
+function formatDate(d){return d.toLocaleString("fr-FR",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});}
+function formatDay(d){return d.toLocaleDateString("fr-FR",{day:"2-digit",month:"2-digit",year:"numeric"});}
+function formatTime(d){return d.toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"});}
+function setText(id,text){var e=document.getElementById(id);if(e)e.textContent=text;}
+function escapeHtml(v){return String(v===undefined||v===null?"":v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");}
+function getError(e){return e&&e.message?e.message:String(e);}
+function waitForElement(id,max){return new Promise(function(resolve,reject){var n=0;(function test(){var e=document.getElementById(id);if(e)return resolve(e);if(++n>=max)return reject(new Error("Element "+id+" introuvable."));setTimeout(test,100);})();});}
