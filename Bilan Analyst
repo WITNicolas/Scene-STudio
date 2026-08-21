@@ -527,7 +527,7 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
 
 
 /* ANALYST V5 - EXTENSIONS COCKPIT ENERGETIQUE
- * Pareto 80/20, heatmap, talon, score, tendance, estimation et exports.
+ * Pareto 80/20, heatmap liee a la selection, talon, score, tendance, estimation et exports.
  */
 (function installAnalystV5Cockpit(){
     "use strict";
@@ -557,10 +557,6 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
 
     bindEvents=function(){
         baseBindEvents();
-        var heatmapSeries=document.getElementById("ayHeatmapSeries");
-        if(heatmapSeries){
-            heatmapSeries.addEventListener("change",function(){renderHeatmap();});
-        }
         var csvButton=document.getElementById("ayExportCsv");
         if(csvButton)csvButton.addEventListener("click",exportAnalysisCsv);
         var printButton=document.getElementById("ayExportPrint");
@@ -570,8 +566,7 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
 
     renderDashboard=function(){
         baseRenderDashboard();
-        populateHeatmapSeries();
-        renderHeatmap();
+        drawHeatmap();
         renderPilotage();
     };
 
@@ -622,7 +617,7 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
             '<div class="ay-v3-view" id="analystHeatmapView" data-view="heatmap" hidden>',
             '<div class="ay-panel">',
             '<div class="ay-v5-toolbar"><div><div class="ay-panel-title">Heatmap energetique</div><div class="ay-panel-subtitle">Intensite moyenne par jour de la semaine et par heure</div></div>',
-            '<select id="ayHeatmapSeries" class="ay-select"><option value="global">Global</option></select></div>',
+            '<div class="ay-badge" id="ayHeatmapSelection">Selection : Global</div></div>',
             '<div class="ay-heatmap-wrap" id="ayHeatmap"></div>',
             '</div></div>',
             '<div class="ay-v3-view" id="analystPilotageView" data-view="pilotage" hidden>',
@@ -644,7 +639,7 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
         Array.prototype.forEach.call(document.querySelectorAll(".analyst-v3-tab"),function(button){
             button.addEventListener("click",function(){
                 var tab=button.getAttribute("data-tab");
-                if(tab==="heatmap")window.requestAnimationFrame(renderHeatmap);
+                if(tab==="heatmap")window.requestAnimationFrame(drawHeatmap);
                 if(tab==="pilotage")window.requestAnimationFrame(renderPilotage);
             });
         });
@@ -673,23 +668,21 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
         });
     }
 
-    function populateHeatmapSeries(){
-        var select=document.getElementById("ayHeatmapSeries");
-        if(!select)return;
-        var previous=select.value||"global";
-        var html='<option value="global">Global</option>';
-        seriesList.forEach(function(s,i){html+='<option value="'+i+'">'+escapeHtml(s.name)+'</option>';});
-        select.innerHTML=html;
-        select.value=previous==="global"||seriesList[Number(previous)]?previous:"global";
-    }
-
-    function renderHeatmap(){
+    function drawHeatmap(){
         var box=document.getElementById("ayHeatmap");
         if(!box)return;
-        var select=document.getElementById("ayHeatmapSeries");
-        var value=select?select.value:"global";
-        var points=value==="global"?allValidPoints().map(function(x){return x.point;}):validPointsForSeries(seriesList[Number(value)]);
-        if(!points.length){box.innerHTML='<div class="ay-empty">Aucune donnee disponible pour la heatmap.</div>';return;}
+
+        var selectedSeries=selectedSeriesIndex>=0?seriesList[selectedSeriesIndex]:null;
+        var points=selectedSeries
+            ? validPointsForSeries(selectedSeries)
+            : allValidPoints().map(function(x){return x.point;});
+        var selectionName=selectedSeries?selectedSeries.name:"Global";
+        setText("ayHeatmapSelection","Selection : "+selectionName);
+
+        if(!points.length){
+            box.innerHTML='<div class="ay-empty">Aucune donnee disponible pour '+escapeHtml(selectionName)+'.</div>';
+            return;
+        }
         var cells=[];for(var d=0;d<7;d++){cells[d]=[];for(var h=0;h<24;h++)cells[d][h]=[];}
         points.forEach(function(p){var day=(p.date.getDay()+6)%7;cells[day][p.date.getHours()].push(p.delta);});
         var averages=[],max=0;
