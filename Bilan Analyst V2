@@ -287,3 +287,115 @@ function setText(id,text){var e=document.getElementById(id);if(e)e.textContent=t
 function escapeHtml(v){return String(v===undefined||v===null?"":v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");}
 function getError(e){return e&&e.message?e.message:String(e);}
 function waitForElement(id,max){return new Promise(function(resolve,reject){var n=0;(function test(){var e=document.getElementById(id);if(e)return resolve(e);if(++n>=max)return reject(new Error("Element "+id+" introuvable."));setTimeout(test,100);})();});}
+/*
+ * ANALYST V2 - Selecteur de vue
+ * A coller A LA FIN du script stackRoot > OnRender existant.
+ *
+ * Ce patch ne remplace aucune fonction metier. Il enrichit injectHtml() et
+ * bindEvents() avant la reprise de initialize() apres son premier await.
+ */
+(function installAnalystViewSelector() {
+    var selectedAnalysisView = "pareto";
+
+    if (typeof injectHtml !== "function" || typeof bindEvents !== "function") {
+        console.error("Analyst : injectHtml ou bindEvents introuvable.");
+        return;
+    }
+
+    var originalInjectHtml = injectHtml;
+    var originalBindEvents = bindEvents;
+
+    injectHtml = function () {
+        originalInjectHtml();
+
+        var content = String(html1.properties.content || "");
+
+        var css = [
+            ".ay-view-selector{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}",
+            ".ay-view-selector label{color:#718198;font-size:10px;font-weight:650}",
+            ".ay-view-select{min-width:210px}",
+            "@media(max-width:760px){.ay-view-selector{width:100%;justify-content:flex-start}.ay-view-select{min-width:0;width:100%}}"
+        ].join("");
+
+        content = content.replace(
+            "</style>",
+            css + "</style>"
+        );
+
+        var oldToolbar = '<div class="ay-toolbar"><div class="ay-series-menu" id="analystSeriesMenu"></div><div class="ay-badge" id="analystLoadingBadge">Chargement</div></div>';
+        var newToolbar = '<div class="ay-toolbar">' +
+            '<div class="ay-series-menu" id="analystSeriesMenu"></div>' +
+            '<div class="ay-view-selector">' +
+                '<label for="analystViewSelect">Vue</label>' +
+                '<select id="analystViewSelect" class="ay-select ay-view-select">' +
+                    '<option value="pareto">Pareto des usages</option>' +
+                    '<option value="profile">Profil horaire global</option>' +
+                '</select>' +
+                '<div class="ay-badge" id="analystLoadingBadge">Chargement</div>' +
+            '</div>' +
+        '</div>';
+
+        content = content.replace(oldToolbar, newToolbar);
+
+        var gridToken = '<div class="ay-grid">';
+        var firstGridIndex = content.indexOf(gridToken);
+
+        if (firstGridIndex >= 0) {
+            content = content.substring(0, firstGridIndex) +
+                '<div class="ay-grid" id="analystParetoView">' +
+                content.substring(firstGridIndex + gridToken.length);
+        }
+
+        var secondGridIndex = content.indexOf(gridToken, firstGridIndex + 1);
+
+        if (secondGridIndex >= 0) {
+            content = content.substring(0, secondGridIndex) +
+                '<div class="ay-grid" id="analystProfileView" style="display:none">' +
+                content.substring(secondGridIndex + gridToken.length);
+        }
+
+        html1.properties.content = content;
+    };
+
+    bindEvents = function () {
+        originalBindEvents();
+
+        var viewSelect = document.getElementById("analystViewSelect");
+
+        if (!viewSelect) {
+            console.error("Analyst : selecteur analystViewSelect introuvable.");
+            return;
+        }
+
+        viewSelect.value = selectedAnalysisView;
+        viewSelect.addEventListener("change", function () {
+            selectedAnalysisView = this.value;
+            updateAnalysisView();
+        });
+
+        updateAnalysisView();
+    };
+
+    function updateAnalysisView() {
+        var paretoView = document.getElementById("analystParetoView");
+        var profileView = document.getElementById("analystProfileView");
+
+        if (!paretoView || !profileView) return;
+
+        var showPareto = selectedAnalysisView === "pareto";
+        paretoView.style.display = showPareto ? "grid" : "none";
+        profileView.style.display = showPareto ? "none" : "grid";
+
+        window.requestAnimationFrame(function () {
+            if (showPareto && chart) {
+                chart.resize();
+                chart.update("none");
+            }
+
+            if (!showPareto && hourChart) {
+                hourChart.resize();
+                hourChart.update("none");
+            }
+        });
+    }
+})();
