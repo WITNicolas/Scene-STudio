@@ -1,9 +1,9 @@
-/* ANALYST V6 - stackRoot > OnRender - aide a la decision energetique */
+/* ANALYST V6.1 - stackRoot > OnRender - donnees REDY deja en deltas */
 var pageActor = this;
 var html1 = context.getActor("html1");
 
 if (!html1) { console.error("Analyst : acteur html1 introuvable."); return; }
-console.log("Analyst V6 : demarrage");
+console.log("Analyst V6.1 DELTA : demarrage");
 
 var ENERGY_SCAN_ROOT = pageActor.stage && pageActor.stage.additionals && pageActor.stage.additionals.bilan
     ? pageActor.stage.additionals.bilan : ":easy.RESS";
@@ -109,8 +109,8 @@ async function loadPeriod(){
     built.forEach(function(s){ scoreAnomalies(s.points); s.points=s.points.filter(function(p){ return p.timestamp>=range.start.getTime()&&p.timestamp<range.end.getTime(); }); });
     built=built.filter(function(s){ return s.points.some(function(p){ return p.validDelta; }); });
     if(!built.length) throw new Error("Aucune consommation calculable apres fusion des index.");
-    mergedRows=merged.rows; seriesList=built; selectedSeriesIndex=-1; selectedAnomalyIndex=0;
-    renderSeriesButtons(); renderDashboard(); updatePeriodInfo(range,parsed.length); setLoading("Pret");
+    mergedRows=merged.rows.filter(function(r){ return r.timestamp>=range.start.getTime()&&r.timestamp<range.end.getTime(); }); seriesList=built; selectedSeriesIndex=-1; selectedAnomalyIndex=0;
+    renderSeriesButtons(); renderDashboard(); updatePeriodInfo(range,files.filter(function(f){return !f.preceding;}).length); setLoading("Pret");
 }
 
 function decodeBase64(value){
@@ -173,20 +173,233 @@ function mergeDailyFiles(files){
     return {headers:headers,rows:rows};
 }
 function buildSeriesFromIndexes(merged){
-    return merged.headers.map(function(header,col){
-        var points=[];
-        merged.rows.forEach(function(row){ var v=row.values[col]; if(v!==null&&v!==undefined&&isFinite(v)) points.push({indexValue:v,delta:null,date:row.date,timestamp:row.timestamp,label:row.dateText,duration:null,validDelta:false,resetDetected:false,gapDetected:false,reference:null,deviation:null,score:0,severity:"normal"}); });
-        points.sort(function(a,b){return a.timestamp-b.timestamp;});
-        for(var i=1;i<points.length;i++){
-            var p=points[i], prev=points[i-1]; p.duration=p.timestamp-prev.timestamp; var delta=p.indexValue-prev.indexValue;
-            if(delta<0){p.resetDetected=true;continue;} p.delta=delta;p.validDelta=true;
+
+    /*
+     * Les valeurs REDY présentes dans les fichiers sont utilisées
+     * directement comme deltas.
+     *
+     * La première valeur positive d'une série est toutefois non
+     * vérifiable si aucune donnée de cette série n'existe pendant
+     * la journée civile précédente.
+     *
+     * Cette valeur est conservée dans rawDelta pour la traçabilité,
+     * mais elle est exclue des calculs avec validDelta = false.
+     */
+
+    return merged.headers.map(function(header, col){
+
+        var points = [];
+
+        merged.rows.forEach(function(row){
+
+            var value = row.values[col];
+
+            if(
+                value === null ||
+                value === undefined ||
+                !isFinite(value)
+            ){
+                return;
+            }
+
+            points.push({
+                indexValue: value,
+
+                /*
+                 * Valeur brute exacte provenant du fichier REDY.
+                 */
+                rawDelta: value,
+
+                /*
+                 * Delta utilisé par Analyst.
+                 * La valeur reste inchangée tant qu'elle est vérifiable.
+                 */
+                delta: value,
+
+                date: row.date,
+                timestamp: row.timestamp,
+                label: row.dateText,
+                duration: null,
+
+                validDelta: value >= 0,
+                resetDetected: false,
+                gapDetected: false,
+                baselineDetected: false,
+                baselineReason: "",
+
+                reference: null,
+                deviation: null,
+                score: 0,
+                severity: "normal"
+            });
+        });
+
+        /*
+         * Tri chronologique.
+         */
+        points.sort(function(a, b){
+            return a.timestamp - b.timestamp;
+        });
+
+        /*
+         * Calcul de la durée entre deux enregistrements.
+         */
+        for(var i = 1; i < points.length; i++){
+
+            points[i].duration =
+                points[i].timestamp -
+                points[i - 1].timestamp;
         }
-        var durations=points.map(function(p){return p.duration;}).filter(function(v){return v>0;}), normal=median(durations);
-        points.forEach(function(p){p.gapDetected=normal>0&&p.duration!==null&&p.duration>normal*1.5;});
-        return {name:header||("Mesure "+(col+1)),color:COLORS[col%COLORS.length],points:points};
+
+        /*
+         * Détection des trous dans l'historique.
+         */
+        var durations = points
+            .map(function(point){
+                return point.duration;
+            })
+            .filter(function(duration){
+                return duration > 0;
+            });
+
+        var normalDuration = median(durations);
+
+        points.forEach(function(point){
+
+            point.gapDetected =
+                normalDuration > 0 &&
+                point.duration !== null &&
+                point.duration > normalDuration * 1.5;
+        });
+
+        /*
+         * Recherche de la première valeur positive de la série.
+         */
+        var firstPositiveIndex = -1;
+
+        for(
+            var positiveIndex = 0;
+            positiveIndex < points.length;
+            positiveIndex++
+        ){
+
+            if(
+                points[positiveIndex].validDelta &&
+                points[positiveIndex].delta > 0
+            ){
+                firstPositiveIndex = positiveIndex;
+                break;
+            }
+        }
+
+        if(firstPositiveIndex >= 0){
+
+            var firstPositivePoint =
+                points[firstPositiveIndex];
+
+            /*
+             * Journée contenant la première valeur positive.
+             */
+            var currentDayStart =
+                startOfDay(firstPositivePoint.date);
+
+            /*
+             * Bornes de la journée civile précédente.
+             *
+             * Exemple :
+             * première valeur positive le 21/08 à 18:00
+             * recherche entre :
+             * 20/08 à 00:00 inclus
+             * 21/08 à 00:00 exclu
+             */
+            var previousDayStart =
+                addDays(currentDayStart, -1);
+
+            var previousDayEnd =
+                currentDayStart;
+
+            /*
+             * Teste l'existence réelle d'au moins une donnée pour
+             * cette série pendant la journée précédente.
+             *
+             * Une valeur égale à zéro compte comme une donnée existante.
+             * Une cellule absente, vide ou non numérique ne compte pas.
+             */
+            var hasPreviousDayData =
+                points.some(function(point){
+
+                    return (
+                        point.timestamp >=
+                            previousDayStart.getTime() &&
+
+                        point.timestamp <
+                            previousDayEnd.getTime() &&
+
+                        point.indexValue !== null &&
+                        point.indexValue !== undefined &&
+                        isFinite(point.indexValue)
+                    );
+                });
+
+            /*
+             * Sans journée précédente, la première valeur positive
+             * ne peut pas être attribuée à un intervalle horaire fiable.
+             *
+             * On conserve sa valeur brute, mais on l'exclut de tous
+             * les calculs énergétiques.
+             */
+            if(!hasPreviousDayData){
+
+                firstPositivePoint.validDelta = false;
+                firstPositivePoint.baselineDetected = true;
+
+                firstPositivePoint.baselineReason =
+                    "Valeur brute d'initialisation : aucune donnée " +
+                    "disponible sur la journée civile précédente";
+
+                firstPositivePoint.reference = null;
+                firstPositivePoint.deviation = null;
+                firstPositivePoint.score = 0;
+                firstPositivePoint.severity = "normal";
+
+                console.warn(
+                    "Analyst : première valeur non exploitable",
+                    {
+                        serie:
+                            header ||
+                            ("Mesure " + (col + 1)),
+
+                        date:
+                            firstPositivePoint.date
+                                .toLocaleString("fr-FR"),
+
+                        valeurBrute:
+                            firstPositivePoint.rawDelta,
+
+                        jourPrecedentRecherche:
+                            previousDayStart
+                                .toLocaleDateString("fr-FR"),
+
+                        raison:
+                            firstPositivePoint.baselineReason
+                    }
+                );
+            }
+        }
+
+        return {
+            name:
+                header ||
+                ("Mesure " + (col + 1)),
+
+            color:
+                COLORS[col % COLORS.length],
+
+            points:
+                points
+        };
     });
 }
-
 function scoreAnomalies(points){
     var buckets=[]; for(var h=0;h<24;h++) buckets.push([]);
     points.forEach(function(p){if(p.validDelta&&p.delta!==null&&isFinite(p.delta)&&p.delta>=0) buckets[p.date.getHours()].push(p.delta);});
@@ -222,8 +435,11 @@ function injectHtml(){
 </style>
 <div class="ay-header"><div class="ay-brand"><div class="ay-logo">A</div><div><div class="ay-title">Analyst V5</div><div class="ay-subtitle">Synthese energetique, priorites et recommandations automatiques</div></div></div><div class="ay-badges"><div class="ay-badge" id="analystRowBadge">0 index</div><div class="ay-badge" id="analystFileBadge">0 fichier</div><div class="ay-badge" id="analystSourceBadge">Chargement...</div></div></div>
 <div class="ay-navigation"><div class="ay-presets"><label>Bilan</label><select id="analystBilanSelect" class="ay-select">${options}</select><button class="analyst-period-button" data-period="today">Aujourd'hui</button><button class="analyst-period-button" data-period="yesterday">Hier</button><button class="analyst-period-button active" data-period="7days">7 jours</button><button class="analyst-period-button" data-period="30days">30 jours</button><button class="analyst-period-button" data-period="all">Toute la periode</button></div><div class="ay-shift"><button class="ay-shift-button" id="analystPreviousPeriod">‹ Periode precedente</button><div class="ay-period-label" id="analystPeriodLabel">Chargement</div><button class="ay-shift-button" id="analystNextPeriod">Periode suivante ›</button></div></div>
-<div class="ay-toolbar"><div class="ay-series-menu" id="analystSeriesMenu"></div><div class="ay-badge" id="analystLoadingBadge">Chargement</div></div>
+<div class="ay-toolbar"><div class="ay-badge" id="analystLoadingBadge">Chargement</div></div>
 <div class="ay-kpis"><div class="ay-kpi"><div class="ay-kpi-label">Consommation totale</div><div class="ay-kpi-value" id="ayTotal">0</div><div class="ay-kpi-meta" id="ayTotalMeta">Toutes les series</div></div><div class="ay-kpi"><div class="ay-kpi-label">Usage principal</div><div class="ay-kpi-value" id="ayTopShare">0 %</div><div class="ay-kpi-meta" id="ayTopName">Aucun usage</div></div><div class="ay-kpi"><div class="ay-kpi-label">Anomalies</div><div class="ay-kpi-value" id="ayAnomalies">0</div><div class="ay-kpi-meta" id="ayAnomalyRate">0 % des intervalles</div></div><div class="ay-kpi"><div class="ay-kpi-label">Consommation nocturne</div><div class="ay-kpi-value" id="ayNightShare">0 %</div><div class="ay-kpi-meta">22h-06h</div></div><div class="ay-kpi"><div class="ay-kpi-label">Pic global</div><div class="ay-kpi-value" id="ayPeak">0</div><div class="ay-kpi-meta" id="ayPeakMeta">Aucun pic</div></div></div>
+
+<div class="ay-serie"><div class="ay-series-menu" id="analystSeriesMenu"></div>
+
 <div class="ay-grid"><div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title">Pareto des usages</div><div class="ay-panel-subtitle">Consommation totale par serie sur la periode</div></div><div class="ay-badge" id="ayParetoBadge">0 usage</div></div><div class="ay-chart"><canvas id="ayParetoCanvas"></canvas></div></div><div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title">Analyse automatique</div><div class="ay-panel-subtitle">Priorites issues des donnees chargees</div></div></div><div class="ay-insights" id="ayInsights"></div><div class="ay-status" id="ayStatusText">Chargement de l'analyse...</div></div></div>
 <div class="ay-grid"><div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title" id="ayProfileTitle">Profil horaire global</div><div class="ay-panel-subtitle" id="ayProfileSubtitle">Somme moyenne des consommations par heure</div></div></div><div class="ay-chart"><canvas id="ayProfileCanvas"></canvas></div></div><div class="ay-panel"><div class="ay-panel-header"><div><div class="ay-panel-title">Classement des usages</div><div class="ay-panel-subtitle">Consommation, part et anomalies</div></div></div><div id="ayRanking"></div></div></div>
 </div>`;
@@ -248,21 +464,183 @@ function renderSeriesButtons(){
 function renderDashboard(){
     var data=computeInsights(),top=data.top,topShare=data.grandTotal&&top?top.total/data.grandTotal*100:0,anRate=data.allPoints.length?data.anomalies.length/data.allPoints.length*100:0,nightShare=data.grandTotal?data.overnight/data.grandTotal*100:0;
     setText("ayTotal",formatNumber(data.grandTotal));setText("ayTotalMeta",data.allPoints.length+" intervalle(s) valide(s)");setText("ayTopShare",formatNumber(topShare)+" %");setText("ayTopName",top?top.series.name:"Aucun usage");setText("ayAnomalies",data.anomalies.length);setText("ayAnomalyRate",formatNumber(anRate)+" % des intervalles");setText("ayNightShare",formatNumber(nightShare)+" %");setText("ayPeak",data.peak?formatNumber(data.peak.point.delta):"0");setText("ayPeakMeta",data.peak?data.peak.series.name+" | "+formatDate(data.peak.point.date):"Aucun pic");setText("ayParetoBadge",data.totals.length+" usage(s)");
-    drawPareto(data);drawProfile();renderRanking(data);renderInsights(data);setText("ayStatusText","Analyse calculee a partir des deltas entre index horaires successifs.");
+    drawPareto(data);drawProfile();renderRanking(data);renderInsights(data);setText("ayStatusText","Analyse calculée à partir des deltas REDY valides de la période.");
 }
 function drawPareto(data){
     var labels=data.totals.map(function(x){return x.series.name;}),values=data.totals.map(function(x){return x.total;}),colors=data.totals.map(function(x){return x.series.color;});
     if(!chart){chart=new Chart(document.getElementById("ayParetoCanvas").getContext("2d"),{type:"bar",data:{labels:labels,datasets:[{data:values,backgroundColor:colors,borderRadius:5}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{beginAtZero:true,grid:{color:"#edf1f5"},ticks:{callback:function(v){return formatNumber(Number(v));}}},y:{grid:{display:false}}},plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){var pct=data.grandTotal?c.parsed.x/data.grandTotal*100:0;return formatNumber(c.parsed.x)+" | "+formatNumber(pct)+" %";}}}}}});}else{chart.data.labels=labels;chart.data.datasets[0].data=values;chart.data.datasets[0].backgroundColor=colors;chart.update("none");}
 }
 function drawProfile(){
-    var selectedSeries=selectedSeriesIndex>=0?seriesList[selectedSeriesIndex]:null;
-    var profilePoints=selectedSeries?validPointsForSeries(selectedSeries):allValidPoints().map(function(x){return x.point;});
-    var profileName=selectedSeries?selectedSeries.name:"Global", profileColor=selectedSeries?selectedSeries.color:"#149fe3";
-    var buckets=[];for(var h=0;h<24;h++)buckets.push([]);profilePoints.forEach(function(p){buckets[p.date.getHours()].push(p.delta);});
-    var labels=[],values=[];for(var i=0;i<24;i++){labels.push(String(i).padStart(2,"0")+"h");var vals=buckets[i];values.push(vals.length?vals.reduce(function(a,b){return a+b;},0)/vals.length:0);}
-    var title=document.getElementById("ayProfileTitle");if(title)title.textContent=selectedSeries?"Profil horaire - "+selectedSeries.name:"Profil horaire global";
-    var subtitle=document.getElementById("ayProfileSubtitle");if(subtitle)subtitle.textContent=selectedSeries?"Consommation moyenne de l usage selectionne par heure":"Somme moyenne des consommations par heure";
-    if(!hourChart){hourChart=new Chart(document.getElementById("ayProfileCanvas").getContext("2d"),{type:"line",data:{labels:labels,datasets:[{label:profileName,data:values,borderColor:profileColor,backgroundColor:hexToRgba(profileColor,.14),fill:true,tension:.25,pointRadius:3}]},options:{responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:"#edf1f5"}}},plugins:{legend:{display:true}}}});}else{hourChart.data.labels=labels;hourChart.data.datasets[0].label=profileName;hourChart.data.datasets[0].data=values;hourChart.data.datasets[0].borderColor=profileColor;hourChart.data.datasets[0].backgroundColor=hexToRgba(profileColor,.14);hourChart.update("none");}
+    var selectedSeries = selectedSeriesIndex >= 0 && seriesList[selectedSeriesIndex]
+        ? seriesList[selectedSeriesIndex]
+        : null;
+
+    var profileName = selectedSeries ? selectedSeries.name : "Global";
+    var profileColor = selectedSeries ? selectedSeries.color : "#149fe3";
+    var profilePoints = [];
+
+    if(selectedSeries){
+        profilePoints = selectedSeries.points.slice().sort(function(a,b){
+            return a.timestamp - b.timestamp;
+        });
+    } else {
+        var timeline = {};
+
+        seriesList.forEach(function(series){
+            series.points.forEach(function(point){
+                var key = String(point.timestamp);
+
+                if(!timeline[key]){
+                    timeline[key] = {
+                        date: point.date,
+                        timestamp: point.timestamp,
+                        delta: 0,
+                        rawDelta: 0,
+                        validDelta: false,
+                        baselineDetected: false,
+                        baselineReason: "",
+                        validSeriesCount: 0,
+                        invalidSeriesCount: 0
+                    };
+                }
+
+                var target = timeline[key];
+
+                if(point.validDelta && point.delta !== null && isFinite(point.delta) && point.delta >= 0){
+                    target.delta += point.delta;
+                    target.rawDelta += point.delta;
+                    target.validDelta = true;
+                    target.validSeriesCount++;
+                } else {
+                    target.invalidSeriesCount++;
+                    if(point.baselineDetected){
+                        target.baselineDetected = true;
+                        target.baselineReason = point.baselineReason || "Valeur initiale non vérifiable";
+                        if(point.rawDelta !== undefined && point.rawDelta !== null && isFinite(point.rawDelta)){
+                            target.rawDelta += point.rawDelta;
+                        }
+                    }
+                }
+            });
+        });
+
+        profilePoints = Object.keys(timeline).map(function(key){
+            return timeline[key];
+        }).sort(function(a,b){
+            return a.timestamp - b.timestamp;
+        });
+    }
+
+    var labels = [];
+    var values = [];
+
+    profilePoints.forEach(function(point){
+        labels.push(point.date.toLocaleString("fr-FR",{
+            day:"2-digit",
+            month:"2-digit",
+            year:"numeric",
+            hour:"2-digit",
+            minute:"2-digit"
+        }));
+
+        values.push(
+            point.validDelta && point.delta !== null && isFinite(point.delta) && point.delta >= 0
+                ? point.delta
+                : null
+        );
+    });
+
+    var periodLabel = {
+        today:"Aujourd'hui",
+        yesterday:"Hier",
+        "7days":"7 jours",
+        "30days":"30 jours",
+        all:"Toute la période"
+    }[selectedPeriod] || "";
+
+    var title = document.getElementById("ayProfileTitle");
+    if(title){
+        title.textContent = selectedSeries
+            ? "Profil - " + selectedSeries.name + " (" + periodLabel + ")"
+            : "Profil (" + periodLabel + ")";
+    }
+
+    var subtitle = document.getElementById("ayProfileSubtitle");
+    if(subtitle){
+        subtitle.textContent = "Données horaires réelles de la période sélectionnée";
+    }
+
+    var canvas = document.getElementById("ayProfileCanvas");
+    if(!canvas) return;
+
+    var maxTicks = selectedPeriod === "today" || selectedPeriod === "yesterday" ? 12 : 20;
+
+    if(hourChart){
+        hourChart.destroy();
+        hourChart = null;
+    }
+
+    hourChart = new Chart(canvas.getContext("2d"),{
+        type:"line",
+        data:{
+            labels:labels,
+            datasets:[{
+                label:profileName,
+                data:values,
+                borderColor:profileColor,
+                backgroundColor:hexToRgba(profileColor,0.14),
+                fill:true,
+                tension:0.15,
+                pointRadius:0,
+                pointHoverRadius:4,
+                spanGaps:false
+            }]
+        },
+        options:{
+            responsive:true,
+            maintainAspectRatio:false,
+            animation:false,
+            interaction:{intersect:false,mode:"index"},
+            scales:{
+                x:{
+                    ticks:{maxTicksLimit:maxTicks,maxRotation:45,minRotation:0},
+                    grid:{display:false}
+                },
+                y:{
+                    beginAtZero:true,
+                    grid:{color:"#edf1f5"},
+                    ticks:{callback:function(value){return formatNumber(Number(value));}}
+                }
+            },
+            plugins:{
+                legend:{display:true},
+                tooltip:{
+                    callbacks:{
+                        title:function(items){
+                            if(!items || !items.length) return "";
+                            var point = profilePoints[items[0].dataIndex];
+                            return point && point.date ? point.date.toLocaleString("fr-FR") : "";
+                        },
+                        label:function(item){
+                            var point = profilePoints[item.dataIndex];
+                            if(!point || !point.validDelta || item.raw === null){
+                                return profileName + " : donnée non vérifiable";
+                            }
+                            return profileName + " : " + formatNumber(Number(item.raw));
+                        },
+                        afterLabel:function(item){
+                            var point = profilePoints[item.dataIndex];
+                            if(!point || !point.baselineDetected) return "";
+                            var raw = point.rawDelta;
+                            return raw !== undefined && raw !== null && isFinite(raw)
+                                ? "Valeur brute initiale exclue : " + formatNumber(raw)
+                                : "Valeur initiale exclue";
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 function renderRanking(data){
     var html='<table class="ay-table"><thead><tr><th>Usage</th><th>Total</th><th>Part</th><th>Anomalies</th></tr></thead><tbody>';
@@ -420,7 +798,7 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
         var tabs = [
             '<div class="ay-v3-tabs" role="tablist" aria-label="Navigation Analyst">',
             '<button class="analyst-v3-tab active" type="button" data-tab="overview" role="tab">Vue d ensemble</button>',
-            '<button class="analyst-v3-tab" type="button" data-tab="profile" role="tab">Profil horaire</button>',
+            '<button class="analyst-v3-tab" type="button" data-tab="profile" role="tab">Profil</button>',
             '<button class="analyst-v3-tab" type="button" data-tab="anomalies" role="tab">Anomalies</button>',
             '</div>'
         ].join("");
@@ -557,15 +935,37 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
 
     bindEvents=function(){
         baseBindEvents();
+        var heatmapSeries=document.getElementById("ayHeatmapSeries");
+        if(heatmapSeries){
+            heatmapSeries.addEventListener("change",function(){
+                selectedSeriesIndex=heatmapSeries.value==="global"?-1:Number(heatmapSeries.value);
+                if(selectedSeriesIndex>=seriesList.length||selectedSeriesIndex<-1)selectedSeriesIndex=-1;
+                renderSeriesButtons();
+                renderDashboard();
+            });
+        }
         var csvButton=document.getElementById("ayExportCsv");
         if(csvButton)csvButton.addEventListener("click",exportAnalysisCsv);
         var printButton=document.getElementById("ayExportPrint");
         if(printButton)printButton.addEventListener("click",function(){window.print();});
         bindV5TabRefresh();
+
+        var help=document.getElementById("ayHelp");
+
+if(help){
+
+    help.addEventListener("click",function(){
+
+var help=document.getElementById("ayHelp");
+context.getActor('modalHelp').properties.isShown = true
+    });
+
+}
     };
 
     renderDashboard=function(){
         baseRenderDashboard();
+        populateAndSyncHeatmapSeries();
         drawHeatmap();
         renderPilotage();
     };
@@ -616,8 +1016,8 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
         var views=[
             '<div class="ay-v3-view" id="analystHeatmapView" data-view="heatmap" hidden>',
             '<div class="ay-panel">',
-            '<div class="ay-v5-toolbar"><div><div class="ay-panel-title">Heatmap energetique</div><div class="ay-panel-subtitle">Intensite moyenne par jour de la semaine et par heure</div></div>',
-            '<div class="ay-badge" id="ayHeatmapSelection">Selection : Global</div></div>',
+            '<div class="ay-v5-toolbar"><div><div class="ay-panel-title">Heatmap energetique</div><div class="ay-panel-subtitle">Analyse hebdomadaire ou calendrier selon la période sélectionnée</div></div>',
+            '<div class="ay-v6-config"><label for="ayHeatmapSeries">Affichage</label><select id="ayHeatmapSeries" class="ay-v6-select"><option value="global">Global</option></select><div class="ay-badge" id="ayHeatmapSelection">Selection : Global</div></div></div>',
             '<div class="ay-heatmap-wrap" id="ayHeatmap"></div>',
             '</div></div>',
             '<div class="ay-v3-view" id="analystPilotageView" data-view="pilotage" hidden>',
@@ -635,6 +1035,20 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
         return content.substring(0,dashboardEnd)+views+content.substring(dashboardEnd);
     }
 
+    function populateAndSyncHeatmapSeries(){
+        var select=document.getElementById("ayHeatmapSeries");
+        if(!select)return;
+        var expected=selectedSeriesIndex>=0?String(selectedSeriesIndex):"global";
+        var html='<option value="global">Global</option>';
+        seriesList.forEach(function(series,index){
+            html+='<option value="'+index+'">'+escapeHtml(series.name)+'</option>';
+        });
+        if(select.options.length!==seriesList.length+1){
+            select.innerHTML=html;
+        }
+        select.value=expected;
+        if(select.value!==expected){select.value="global";selectedSeriesIndex=-1;}
+    }
     function bindV5TabRefresh(){
         Array.prototype.forEach.call(document.querySelectorAll(".analyst-v3-tab"),function(button){
             button.addEventListener("click",function(){
@@ -668,32 +1082,292 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
         });
     }
 
-    function drawHeatmap(){
-        var box=document.getElementById("ayHeatmap");
-        if(!box)return;
+function drawHeatmap(){
 
-        var selectedSeries=selectedSeriesIndex>=0?seriesList[selectedSeriesIndex]:null;
-        var points=selectedSeries
+    var box = document.getElementById("ayHeatmap");
+    if(!box) return;
+
+    populateAndSyncHeatmapSeries();
+
+    var selectedSeries =
+        selectedSeriesIndex >= 0 &&
+        seriesList[selectedSeriesIndex]
+            ? seriesList[selectedSeriesIndex]
+            : null;
+
+    var points =
+        selectedSeries
             ? validPointsForSeries(selectedSeries)
-            : allValidPoints().map(function(x){return x.point;});
-        var selectionName=selectedSeries?selectedSeries.name:"Global";
-        setText("ayHeatmapSelection","Selection : "+selectionName);
+            : allValidPoints().map(function(x){
+                return x.point;
+            });
 
-        if(!points.length){
-            box.innerHTML='<div class="ay-empty">Aucune donnee disponible pour '+escapeHtml(selectionName)+'.</div>';
-            return;
-        }
-        var cells=[];for(var d=0;d<7;d++){cells[d]=[];for(var h=0;h<24;h++)cells[d][h]=[];}
-        points.forEach(function(p){var day=(p.date.getDay()+6)%7;cells[day][p.date.getHours()].push(p.delta);});
-        var averages=[],max=0;
-        for(var day=0;day<7;day++){averages[day]=[];for(var hour=0;hour<24;hour++){var a=cells[day][hour];var avg=a.length?a.reduce(function(x,y){return x+y;},0)/a.length:0;averages[day][hour]=avg;if(avg>max)max=avg;}}
-        var names=["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"];
-        var html='<table class="ay-heatmap"><thead><tr><th>Jour</th>';
-        for(var h=0;h<24;h++)html+='<th>'+String(h).padStart(2,"0")+'h</th>';
-        html+='</tr></thead><tbody>';
-        for(var d=0;d<7;d++){html+='<tr><th>'+names[d]+'</th>';for(var hr=0;hr<24;hr++){var v=averages[d][hr],ratio=max?v/max:0;var color=heatColor(ratio);html+='<td style="background:'+color+'" title="'+names[d]+' '+String(hr).padStart(2,"0")+'h : '+escapeHtml(formatNumber(v))+'">'+(v?escapeHtml(formatNumber(v)):'')+'</td>';}html+='</tr>';}
-        box.innerHTML=html+'</tbody></table>';
+    var selectionName =
+        selectedSeries
+            ? selectedSeries.name
+            : "Global";
+
+    setText(
+        "ayHeatmapSelection",
+        "Sélection : " + selectionName
+    );
+
+    if(!points.length){
+
+        box.innerHTML =
+            '<div class="ay-empty">' +
+            'Aucune donnée disponible.' +
+            '</div>';
+
+        return;
     }
+
+    /*
+     * MODE SEMAINE
+     */
+
+    if(
+        selectedPeriod === "today" ||
+        selectedPeriod === "yesterday" ||
+        selectedPeriod === "7days"
+    ){
+
+        renderWeeklyHeatmap(box, points);
+        return;
+    }
+
+    /*
+     * MODE CALENDRIER
+     */
+
+    renderCalendarHeatmap(box, points);
+}
+
+
+
+function renderWeeklyHeatmap(box, points){
+
+    var cells = [];
+
+    for(var d=0; d<7; d++){
+
+        cells[d] = [];
+
+        for(var h=0; h<24; h++){
+            cells[d][h] = [];
+        }
+    }
+
+    points.forEach(function(p){
+
+        var day =
+            (p.date.getDay() + 6) % 7;
+
+        cells[day][p.date.getHours()]
+            .push(p.delta);
+
+    });
+
+    var averages = [];
+    var maxValue = 0;
+
+    for(var d=0; d<7; d++){
+
+        averages[d] = [];
+
+        for(var h=0; h<24; h++){
+
+            var values = cells[d][h];
+
+            var avg =
+                values.length
+                    ? values.reduce(function(a,b){
+                        return a+b;
+                      },0) / values.length
+                    : 0;
+
+            averages[d][h] = avg;
+
+            if(avg > maxValue){
+                maxValue = avg;
+            }
+        }
+    }
+
+    var days = [
+        "Lun",
+        "Mar",
+        "Mer",
+        "Jeu",
+        "Ven",
+        "Sam",
+        "Dim"
+    ];
+
+    var html =
+        '<table class="ay-heatmap">';
+
+    html += '<thead><tr><th>Jour</th>';
+
+    for(var h=0; h<24; h++){
+
+        html +=
+            '<th>' +
+            String(h).padStart(2,"0") +
+            'h</th>';
+
+    }
+
+    html += '</tr></thead><tbody>';
+
+    for(var d=0; d<7; d++){
+
+        html += '<tr>';
+
+        html += '<th>' + days[d] + '</th>';
+
+        for(var h=0; h<24; h++){
+
+            var value = averages[d][h];
+
+            var ratio =
+                maxValue
+                    ? value/maxValue
+                    : 0;
+
+            html +=
+                '<td style="background:' +
+                heatColor(ratio) +
+                '">' +
+                (value
+                    ? formatNumber(value)
+                    : ''
+                ) +
+                '</td>';
+        }
+
+        html += '</tr>';
+    }
+
+    html += '</tbody></table>';
+
+    box.innerHTML = html;
+}
+
+
+
+function renderCalendarHeatmap(box, points){
+
+    var startDate = selectedRange().start;
+    var endDate   = selectedRange().end;
+
+    var rows = {};
+    var maxValue = 0;
+
+    /*
+     * création de toutes les dates
+     */
+
+    var current =
+        new Date(startDate.getTime());
+
+    while(current < endDate){
+
+        var key = formatDay(current);
+
+        rows[key] = [];
+
+        for(var h=0; h<24; h++){
+            rows[key][h] = 0;
+        }
+
+        current =
+            addDays(current,1);
+    }
+
+    /*
+     * alimentation
+     */
+
+    points.forEach(function(p){
+
+        var key =
+            formatDay(p.date);
+
+        if(!rows[key]) return;
+
+        var hour =
+            p.date.getHours();
+
+        rows[key][hour] += p.delta;
+
+        if(rows[key][hour] > maxValue){
+
+            maxValue =
+                rows[key][hour];
+        }
+
+    });
+
+    var html =
+        '<div style="max-height:650px;overflow:auto;">';
+
+    html +=
+        '<table class="ay-heatmap">';
+
+    html +=
+        '<thead><tr><th>Date</th>';
+
+    for(var h=0; h<24; h++){
+
+        html +=
+            '<th>' +
+            String(h).padStart(2,"0") +
+            'h</th>';
+
+    }
+
+    html +=
+        '</tr></thead><tbody>';
+
+    Object.keys(rows).forEach(function(day){
+
+        html += '<tr>';
+
+        html +=
+            '<th>' +
+            day +
+            '</th>';
+
+        for(var h=0; h<24; h++){
+
+            var value =
+                rows[day][h];
+
+            var ratio =
+                maxValue
+                    ? value/maxValue
+                    : 0;
+
+            html +=
+                '<td style="background:' +
+                heatColor(ratio) +
+                '">' +
+                (value
+                    ? formatNumber(value)
+                    : ''
+                ) +
+                '</td>';
+        }
+
+        html += '</tr>';
+    });
+
+    html +=
+        '</tbody></table></div>';
+
+    box.innerHTML = html;
+}
 
     function heatColor(ratio){
         ratio=Math.max(0,Math.min(1,ratio));
@@ -760,7 +1434,7 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
         data.anomalies.forEach(function(x){rows.push([x.point.severity,x.series.name,formatDate(x.point.date),x.point.delta,x.point.reference,x.point.deviation,x.point.score]);});
         var csv=rows.map(function(row){return row.map(function(v){return '"'+String(v===undefined||v===null?"":v).replace(/"/g,'""')+'"';}).join(";");}).join("\r\n");
         var blob=new Blob(["\uFEFF"+csv],{type:"text/csv;charset=utf-8"});
-        var url=URL.createObjectURL(blob);var a=document.createElement("a");a.href=url;a.download="Analyst_V5_"+new Date().toISOString().slice(0,10)+".csv";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
+        var url=URL.createObjectURL(blob);var a=document.createElement("a");a.href=url;a.download="Analyst_V6_"+new Date().toISOString().slice(0,10)+".csv";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
     }
 })();
 
@@ -872,7 +1546,9 @@ function waitForElement(id,max){return new Promise(function(resolve,reject){var 
         var replacement='<div class="ay-v6-config">'+
             '<label for="ayV6Price">Prix energie</label><input id="ayV6Price" class="ay-v6-input" inputmode="decimal" value="0,18"><span class="ay-panel-subtitle">EUR/kWh</span>'+
             '<label for="ayV6Mode">Mode</label><select id="ayV6Mode" class="ay-v6-select"><option value="exploitant">Exploitant</option><option value="direction">Direction</option></select>'+
-            loading+'</div>';
+            '<button id="ayHelp" class="ay-v5-button" type="button">❔ Aide</button>'+
+loading+
+'</div>';
         return content.replace(loading,replacement);
     }
 
